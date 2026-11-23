@@ -150,7 +150,7 @@ if (mode === "lingering-pipe") {
 
 function fixture(t, { mode = "", withCodex = true } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-"));
-  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const root = fs.realpathSync(temp);
   const cwd = path.join(root, "project with spaces");
   const bin = path.join(root, "bin");
@@ -551,7 +551,11 @@ test("bounds inherited pipe draining", async (t) => {
     assert.doesNotThrow(() => process.kill(invocations[0].descendantPid, 0));
   } finally {
     const line = fs.readFileSync(f.log, "utf8").trim();
-    if (line) forceKill(JSON.parse(line).descendantPid);
+    if (line) {
+      const pid = JSON.parse(line).descendantPid;
+      forceKill(pid);
+      await waitForProcessDeath(pid, AbortSignal.timeout(5_000));
+    }
   }
 });
 
