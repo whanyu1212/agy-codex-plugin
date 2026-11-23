@@ -45,10 +45,11 @@ Antigravity's native `run_command` background execution and reactive wakeup.
    - **Continue previous Codex session in this repo** (when the user asks to
      resume/continue/keep going):
      ```bash
-     codex exec resume --last - <<'EOF'
+     codex exec -s read-only resume --last - <<'EOF'
      <follow-up instruction>
      EOF
      ```
+     Use `-s workspace-write` for write-capable follow-ups.
 
 2. **Execute via `run_command`**:
    - For quick, bounded read-only questions, use `WaitMsBeforeAsync: 10000`.

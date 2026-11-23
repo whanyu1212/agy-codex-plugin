@@ -35,7 +35,7 @@ parent agent.
    - **Write-capable rescue / implementation**:
      `codex exec -s workspace-write - <<'EOF' ... EOF`
    - **Resume last Codex session**:
-     `codex exec resume --last - <<'EOF' ... EOF`
+     `codex exec -s read-only resume --last - <<'EOF' ... EOF` (use `-s workspace-write` for write-capable follow-ups).
 4. Use `WaitMsBeforeAsync: 10000` when calling `run_command` (since you are
    already running as a background subagent) and wait for completion if it
    backgrounds.

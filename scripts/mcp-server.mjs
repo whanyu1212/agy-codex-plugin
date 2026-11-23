@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { promises as fs, readFileSync } from "node:fs";
 import process from "node:process";
 import { createInterface } from "node:readline";
 import {
@@ -19,6 +18,7 @@ const timeoutProperty = {
   description: "Time limit in milliseconds for the tool's commands."
 };
 const supportedProtocolVersions = ["2025-06-18", "2024-11-05"];
+const version = JSON.parse(readFileSync(new URL("../plugin.json", import.meta.url), "utf8")).version;
 const activeCalls = new Map();
 
 const tools = [
@@ -141,13 +141,19 @@ function validateArguments(args, schema) {
 }
 
 async function validateCwd(cwd, signal) {
-  const info = await withAbort(signal, () => fs.stat(cwd)).catch((error) => {
+  let canonicalCwd;
+  let info;
+  try {
+    canonicalCwd = await withAbort(signal, () => fs.realpath(cwd));
+    info = await withAbort(signal, () => fs.stat(canonicalCwd));
+  } catch (error) {
     signal.throwIfAborted();
     throw new Error(`Cannot access cwd ${JSON.stringify(cwd)}: ${error.message}`, { cause: error });
-  });
+  }
   if (!info.isDirectory()) {
     throw new Error(`cwd must be a directory: ${JSON.stringify(cwd)}.`);
   }
+  return canonicalCwd;
 }
 
 function effortArgs(effort) {
@@ -201,7 +207,7 @@ async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephem
   if (model !== undefined && model.startsWith("-")) {
     throw new Error("model must not start with '-'.");
   }
-  const args = ["exec", "--json", "-s", sandbox, "-C", path.resolve(cwd), ...effortArgs(effort)];
+  const args = ["exec", "--json", "-s", sandbox, "-C", cwd, ...effortArgs(effort)];
   if (model !== undefined) {
     args.push("-m", model);
   }
@@ -264,10 +270,8 @@ async function callTool(tool, args = {}, signal) {
     timer = setTimeout(() => {
       timeout.abort(new Error(`${tool.name} timed out after ${timeoutMs} ms.`));
     }, timeoutMs).unref();
-    if (args.cwd !== undefined) {
-      await validateCwd(args.cwd, executionSignal);
-    }
-    return toolResult(await tool.run(args, executionSignal));
+    const toolArgs = args.cwd === undefined ? args : { ...args, cwd: await validateCwd(args.cwd, executionSignal) };
+    return toolResult(await tool.run(toolArgs, executionSignal));
   } catch (error) {
     return toolResult(error.message, true);
   } finally {
@@ -328,7 +332,7 @@ async function handleLine(line) {
             ? protocolVersion
             : supportedProtocolVersions[0],
           capabilities: { tools: {} },
-          serverInfo: { name: "codex-cli", version: "0.2.1" }
+          serverInfo: { name: "codex-cli", version }
         }
       });
       break;

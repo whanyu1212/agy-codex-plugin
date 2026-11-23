@@ -8,7 +8,7 @@ A zero-dependency **Antigravity (`agy`)** plugin for delegating code reviews, ad
 
 - **OpenAI Codex CLI** (`codex`) installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated (`codex login`)
 - **Antigravity** (`agy` CLI, Antigravity App, or Antigravity IDE)
-- **Node.js** on `PATH` (for the bundled MCP server and optional Stop hook)
+- **Node.js 22+** on `PATH` (for the bundled MCP server and optional Stop hook)
 
 ### Install
 
@@ -68,15 +68,17 @@ To enable it, set `"enabled": true` in your installed plugin copy at `~/.gemini/
 
 ## Development & Testing
 
+Run `agy plugin install .` after edits to refresh the locally installed plugin.
+
 ```bash
 # Run unit tests (uses a fake codex fixture on PATH)
-node --test tests/stop-review-gate.test.mjs tests/mcp-server.test.mjs
+node --test tests/manifest.test.mjs tests/stop-review-gate.test.mjs tests/mcp-server.test.mjs
 
 # Strictly validate the plugin manifest and MCP server registration
 agy plugin validate --strict .
 ```
 
-CI runs both test suites on Node.js 22 across Linux, macOS, and Windows via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+CI runs these tests on Node.js 22 across Linux, macOS, and Windows via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## License
 
