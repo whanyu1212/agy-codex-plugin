@@ -31,7 +31,10 @@ const commands = {
   },
   resume: {
     run: runResume,
-    options: { ...commonOptions, ...effortOption, ...sandboxOption, session: { type: "string" } },
+    options: {
+      ...commonOptions, ...effortOption, ...sandboxOption,
+      session: { type: "string" }, last: { type: "boolean" }
+    },
     readsPrompt: true
   },
   doctor: { run: runDoctor, options: commonOptions }

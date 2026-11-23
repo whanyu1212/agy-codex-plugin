@@ -8,7 +8,7 @@ A zero-dependency **Antigravity (`agy`)** plugin for delegating code reviews, ad
 
 - **OpenAI Codex CLI** (`codex`) installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated (`codex login`)
 - **Antigravity** (`agy` CLI, Antigravity App, or Antigravity IDE)
-- **Node.js 22+** on `PATH` (for the bundled CLI runner, MCP server, and optional Stop hook)
+- **Node.js 22.15+** on `PATH` (for the bundled CLI runner, MCP server, and optional Stop hook)
 
 ### Install
 
@@ -36,7 +36,7 @@ agy plugin list
 | `/codex-rescue` | Delegate diagnosis (`read-only`), fixes (`workspace-write`), or follow-ups | `/codex-rescue diagnose why tests/auth.test.ts is flaky` |
 | `/codex-setup` | Check `codex` binary, version, and authentication health | `/codex-setup` |
 
-The skills run [`scripts/codex-run.mjs`](scripts/codex-run.mjs) for background work. Use `node /path/to/plugin/scripts/codex-run.mjs` with `review`, `exec`, `resume`, or `doctor` from your repository. For bounded runs, pass `--effort medium`. To continue the most recent session, run `resume` with the follow-up prompt on stdin.
+The skills run [`scripts/codex-run.mjs`](scripts/codex-run.mjs) for background work. Use `node /path/to/plugin/scripts/codex-run.mjs` with `review`, `exec`, `resume`, or `doctor` from your repository. For bounded runs, pass `--effort medium`. To continue a specific session, run `resume --session <sessionId>` with the follow-up prompt on stdin (pass `--cwd <worktreePath>` when resuming a managed worktree, or opt in to the latest session with `--last`).
 
 ## MCP Tools
 
@@ -45,8 +45,8 @@ Antigravity starts the bundled zero-dependency Node.js stdio MCP server via [`mc
 | Tool | Key parameters | Output |
 | :--- | :--- | :--- |
 | `codex_review` | `cwd`, optional `target` (`uncommitted` default, `base`, `commit`), `base`/`commit`, `prompt` | Read-only review output |
-| `codex_exec` | `cwd`, `prompt`, optional `sandbox` (`read-only` default or `workspace-write`), `model`, `worktree`, `ephemeral` | JSON with `sessionId` and `finalMessage` |
-| `codex_resume` | `cwd`, `prompt`, optional `sessionId` (defaults to latest in `cwd`), `sandbox` | JSON with `sessionId` and `finalMessage` |
+| `codex_exec` | `cwd`, `prompt`, optional `sandbox` (`read-only` default or `workspace-write`), `model`, `worktree`, `ephemeral` | JSON with `sessionId`, `resumable`, `repoRoot`, `worktreePath`, `finalMessage` |
+| `codex_resume` | `cwd` (pass prior `worktreePath` if present), `prompt`, `sessionId` (or `last: true` opt-in), optional `sandbox` | JSON with `sessionId`, `resumable`, `repoRoot`, `worktreePath`, `finalMessage` |
 | `codex_doctor` | Optional `cwd` | Codex version and diagnostic output |
 
 Common options & notes:

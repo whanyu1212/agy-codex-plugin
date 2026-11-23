@@ -36,20 +36,27 @@ parent agent.
      `node "<plugin-root>/scripts/codex-run.mjs" exec --sandbox read-only` with the prompt on stdin.
    - **Write-capable rescue / implementation**:
      `node "<plugin-root>/scripts/codex-run.mjs" exec --sandbox workspace-write` with the prompt on stdin.
-   - **Resume last Codex session**:
-     `node "<plugin-root>/scripts/codex-run.mjs" resume --sandbox read-only` with the prompt on stdin.
-     Use `--sandbox workspace-write` for write-capable follow-ups.
+   - **Resume a specific Codex session** (default for continuations):
+     `node "<plugin-root>/scripts/codex-run.mjs" resume --session "<sessionId>" --sandbox read-only` with the prompt on stdin.
+     If the prior run returned a non-null `worktreePath`, pass `--cwd "<worktreePath>"`
+     so the follow-up runs in that isolated worktree rather than the main checkout.
+     Only pass `--last` instead of `--session` when the parent explicitly asks to resume the latest session and no `sessionId` was provided.
+     Require explicit parent authorization before upgrading a prior `read-only` session to `--sandbox workspace-write`.
 
    If the runner script is unavailable, use `codex exec -s read-only review`
    with the target flag for a standard review, or `codex exec -s read-only review -`
    with the target and rubric on stdin for a focused review. For other prompts,
    use `codex exec -s <sandbox> --json -` or
-   `codex exec -s <sandbox> resume --json --last -` and read the session ID
+   `codex exec -s <sandbox> resume --json -- "$session_id" -` (run from
+   `<worktreePath>` via `cd "<worktreePath>" && ...` when resuming a managed
+   worktree, or `--last` only when explicitly requested) and read the session ID
    and final message from the events.
 4. Use `WaitMsBeforeAsync: 10000` when calling `run_command` (since you are
    already running as a background subagent) and wait for completion if it
    backgrounds. Antigravity wakes you when the command completes.
-5. For `exec` and `resume`, return the runner's `sessionId` and `finalMessage`.
+5. For `exec` and `resume`, return the runner's `sessionId`, `resumable`,
+   `repoRoot`, `worktreePath` (when non-null), and `finalMessage`.
    Return review findings concisely and accurately without inventing findings or
-   editing files yourself. If `codex` is missing or unauthenticated, report the
-   exact error and suggest running `/codex-setup`.
+   editing files yourself. If `codex` is missing, unauthenticated, or a session
+   cannot be resumed, report the exact error and next steps (such as `/codex-setup`
+   or starting a fresh `exec` run).
