@@ -1,13 +1,23 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 
 const cwdProperty = { type: "string", minLength: 1, description: "Working directory for Codex." };
 const promptProperty = { type: "string", minLength: 1, description: "Prompt to send to Codex on stdin." };
+const sandboxProperty = { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" };
+const supportedProtocolVersions = ["2025-06-18", "2024-11-05"];
+const outputLimit = 1024 * 1024;
+const truncationMarker = "[output truncated]";
+const pipeDrainMs = 250;
+const terminationGraceMs = 500;
+const useProcessGroups = process.platform !== "win32";
 const activeChildren = new Set();
+const activeCalls = new Map();
 
 const tools = [
   {
@@ -45,7 +55,7 @@ const tools = [
       properties: {
         cwd: cwdProperty,
         prompt: promptProperty,
-        sandbox: { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" },
+        sandbox: sandboxProperty,
         model: { type: "string", minLength: 1 },
         worktree: { type: "boolean", description: "Run in a new managed Git worktree." },
         ephemeral: { type: "boolean", description: "Run without persisting session files." }
@@ -57,13 +67,15 @@ const tools = [
   },
   {
     name: "codex_resume",
-    description: "Continue a Codex session by ID, or resume the most recent session in the working directory.",
+    description: "Continue a Codex session by ID or name, or resume the most recent session in the working directory. "
+      + "In Codex 0.171.0, a missing UUID returns an error. An unknown name or no recent session starts a new session.",
     inputSchema: {
       type: "object",
       properties: {
         cwd: cwdProperty,
         prompt: promptProperty,
-        sessionId: { type: "string", minLength: 1, description: "Session to resume. Omit to use --last." }
+        sessionId: { type: "string", minLength: 1, description: "Session to resume. Omit to use --last." },
+        sandbox: sandboxProperty
       },
       required: ["cwd", "prompt"],
       additionalProperties: false
@@ -124,60 +136,64 @@ function cleanOutput(text) {
   return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").trim();
 }
 
-function runCodex(args, { cwd, input } = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("codex", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-    activeChildren.add(child);
-    let stdout = "";
-    let stderr = "";
-    let stdinError;
-
-    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-    child.stdin.on("error", (error) => { stdinError = error; });
-    child.on("error", (error) => {
-      const message = error.code === "ENOENT"
-        ? "Could not start codex. Check that Codex is installed and available on PATH and cwd still exists."
-        : `Could not start codex: ${error.message}`;
-      reject(new Error(message, { cause: error }));
-    });
-    child.on("close", (code, signal) => {
-      activeChildren.delete(child);
-      if (code !== 0) {
-        const status = signal ? `was terminated by ${signal}` : `exited with code ${code}`;
-        const details = [cleanOutput(stderr), cleanOutput(stdout)].filter(Boolean).join("\n");
-        reject(new Error(`Codex ${status}.${details ? `\n${details}` : ""}`));
-      } else if (stdinError) {
-        reject(new Error(`Could not send prompt to codex: ${stdinError.message}`, { cause: stdinError }));
-      } else {
-        resolve({ stdout, stderr });
+function boundedOutput() {
+  let buffer;
+  let size = 0;
+  let truncated = false;
+  return {
+    get truncated() { return truncated; },
+    append(chunk) {
+      const length = Math.min(chunk.length, outputLimit - size);
+      if (length > 0) {
+        if (size + length > (buffer?.length ?? 0)) {
+          const capacity = Math.min(outputLimit, Math.max(256, size + length, 2 * (buffer?.length ?? 0)));
+          const grown = Buffer.allocUnsafe(capacity);
+          buffer?.copy(grown, 0, 0, size);
+          buffer = grown;
+        }
+        chunk.copy(buffer, size, 0, length);
+        size += length;
       }
-    });
-    child.stdin.end(input);
-  });
+      truncated ||= length < chunk.length;
+    },
+    text() {
+      return (buffer?.toString("utf8", 0, size) ?? "") + (truncated ? `\n${truncationMarker}` : "");
+    }
+  };
 }
 
-function commandOutput({ stdout, stderr }) {
-  return cleanOutput(stdout) || cleanOutput(stderr);
-}
-
-function parseExecOutput(stdout) {
-  const cleaned = cleanOutput(stdout);
+function collectExecEvents() {
+  let line = boundedOutput();
+  let sawEvents = false;
   let sessionId = null;
-  let finalMessage;
-  const plainLines = [];
-  for (const line of cleaned.split(/\r?\n/)) {
+  let finalMessage = null;
+
+  function parseLine() {
+    const text = cleanOutput(line.text());
+    if (line.truncated) {
+      // Codex writes the event type before the payload, including oversized items.
+      const event = /^\{\s*"type"\s*:\s*"([^"]+)"/.exec(text);
+      if (!event) {
+        return;
+      }
+      sawEvents = true;
+      const [prefix, type] = event;
+      const completedAgentMessage = /^\s*,\s*"item"\s*:\s*\{(?:\s*"id"\s*:\s*"[^"]*"\s*,)?\s*"type"\s*:\s*"agent_message"/;
+      if (type === "agent_message" || (type === "item.completed" && completedAgentMessage.test(text.slice(prefix.length)))) {
+        finalMessage = truncationMarker;
+      }
+      return;
+    }
     let event;
     try {
-      event = JSON.parse(line);
+      event = JSON.parse(text);
     } catch {
-      plainLines.push(line);
-      continue;
+      return;
     }
     if (typeof event?.type !== "string") {
-      plainLines.push(line);
-      continue;
+      return;
     }
+    sawEvents = true;
     if (event.type === "thread.started" || event.type === "session.started") {
       const id = event.thread_id ?? event.session_id;
       if (typeof id === "string") {
@@ -189,11 +205,188 @@ function parseExecOutput(stdout) {
       finalMessage = item.text;
     }
   }
-  const fallback = plainLines.join("\n").trim() || cleaned;
-  return { sessionId, finalMessage: finalMessage ?? fallback };
+
+  return {
+    append(chunk) {
+      let start = 0;
+      for (let end = chunk.indexOf(10); end !== -1; end = chunk.indexOf(10, start)) {
+        line.append(chunk.subarray(start, end));
+        parseLine();
+        line = boundedOutput();
+        start = end + 1;
+      }
+      line.append(chunk.subarray(start));
+    },
+    finish(stdout) {
+      parseLine();
+      return { sessionId, finalMessage: sawEvents ? finalMessage : cleanOutput(stdout) };
+    }
+  };
 }
 
-async function review({ cwd, target = "uncommitted", base, commit, prompt }) {
+async function isFile(file) {
+  const stat = await fs.stat(file).catch(() => null);
+  return stat?.isFile() ?? false;
+}
+
+async function resolveWindowsCodex(args) {
+  const directories = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  for (const directory of directories) {
+    const executable = path.resolve(directory.replace(/^"|"$/g, ""), "codex.exe");
+    if (await isFile(executable)) {
+      return [executable, args];
+    }
+  }
+  for (const directory of directories) {
+    const shim = path.resolve(directory.replace(/^"|"$/g, ""), "codex.cmd");
+    const contents = await fs.readFile(shim, "utf8").catch(() => "");
+    // Read npm's generated Node entrypoint without evaluating the batch file.
+    const target = contents.match(/"%_prog%"[ \t]+"%dp0%\\([^"\r\n]+\.js)"[ \t]+%\*[ \t]*$/im)?.[1];
+    if (target) {
+      const entrypoint = path.resolve(path.dirname(shim), target);
+      if (await isFile(entrypoint)) {
+        return [process.execPath, [entrypoint, ...args]];
+      }
+    }
+  }
+  throw new Error("Could not start codex. Check PATH for codex.exe or an npm-generated codex.cmd.");
+}
+
+function signalGroup(pid, signal) {
+  if (useProcessGroups && pid !== undefined) {
+    try {
+      return process.kill(-pid, signal);
+    } catch (error) {
+      return signal === 0 && error.code === "EPERM";
+    }
+  }
+  return false;
+}
+
+async function waitForProcessTree(child, isRunning, graceMs) {
+  const deadline = performance.now() + graceMs;
+  while (isRunning() || signalGroup(child.pid, 0)) {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) {
+      return false;
+    }
+    await delay(Math.min(remaining, 25));
+  }
+  return true;
+}
+
+async function terminateProcessTree(child, isRunning) {
+  if (!useProcessGroups) {
+    if (isRunning()) {
+      // Killing the npm launcher alone would leave its native Codex subprocess running.
+      const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+      const taskkill = path.join(systemRoot, "System32", "taskkill.exe");
+      const args = ["/PID", String(child.pid), "/T", "/F"];
+      await new Promise((done) => execFile(taskkill, args, { timeout: terminationGraceMs, windowsHide: true }, done));
+      if (isRunning()) {
+        child.kill("SIGKILL");
+        await waitForProcessTree(child, isRunning, pipeDrainMs);
+      }
+    }
+    return;
+  }
+  if (!signalGroup(child.pid, "SIGTERM") && isRunning()) {
+    child.kill("SIGTERM");
+  }
+  if (!await waitForProcessTree(child, isRunning, terminationGraceMs)) {
+    if (!signalGroup(child.pid, "SIGKILL") && isRunning()) {
+      child.kill("SIGKILL");
+    }
+    await waitForProcessTree(child, isRunning, pipeDrainMs);
+  }
+}
+
+function runCommand(command, args, { cwd, input, signal, jsonl, label }) {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd, stdio: ["pipe", "pipe", "pipe"], detached: useProcessGroups, windowsHide: true
+    });
+    const stdout = boundedOutput();
+    const stderr = boundedOutput();
+    const events = jsonl ? collectExecEvents() : undefined;
+    let running = child.pid !== undefined;
+    let settled = false;
+    let drainTimer;
+    let stdinError;
+    let spawnError;
+    let termination;
+    const terminate = () => termination ??= terminateProcessTree(child, () => running);
+
+    activeChildren.add(terminate);
+    signal.addEventListener("abort", terminate, { once: true });
+    child.stdout.on("data", (chunk) => {
+      stdout.append(chunk);
+      events?.append(chunk);
+    });
+    child.stderr.on("data", (chunk) => stderr.append(chunk));
+    child.stdin.on("error", (error) => { stdinError = error; });
+    child.on("error", (error) => {
+      spawnError = error;
+    });
+
+    function finish(code, exitSignal) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(drainTimer);
+      const complete = () => {
+        activeChildren.delete(terminate);
+        signal.removeEventListener("abort", terminate);
+        signal.throwIfAborted();
+        const output = { stdout: stdout.text(), stderr: stderr.text() };
+        if (spawnError) {
+          const message = spawnError.code === "ENOENT"
+            ? `Could not start ${label}. Check that ${label} is installed and available on PATH and cwd still exists.`
+            : `Could not start ${label}: ${spawnError.message}`;
+          throw new Error(message, { cause: spawnError });
+        }
+        if (code !== 0) {
+          const status = exitSignal ? `was terminated by ${exitSignal}` : `exited with code ${code}`;
+          const details = [cleanOutput(output.stderr), cleanOutput(output.stdout)].filter(Boolean).join("\n");
+          throw new Error(`${label} ${status}.${details ? `\n${details}` : ""}`);
+        }
+        if (stdinError) {
+          throw new Error(`Could not send input to ${label}: ${stdinError.message}`, { cause: stdinError });
+        }
+        return { ...output, result: events?.finish(output.stdout) };
+      };
+      Promise.resolve(termination).then(complete).then(resolve, reject);
+    }
+
+    child.once("exit", (code, exitSignal) => {
+      running = false;
+      drainTimer = setTimeout(() => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish(code, exitSignal);
+      }, pipeDrainMs);
+    });
+    child.once("close", (code, exitSignal) => {
+      running = false;
+      finish(code, exitSignal);
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function runCodex(args, options) {
+  const [command, argv] = useProcessGroups ? ["codex", args] : await resolveWindowsCodex(args);
+  return runCommand(command, argv, { ...options, label: "Codex" });
+}
+
+function commandOutput({ stdout, stderr }) {
+  return cleanOutput(stdout) || cleanOutput(stderr);
+}
+
+async function review({ cwd, target = "uncommitted", base, commit, prompt }, signal) {
   if (target !== "base" && base !== undefined) {
     throw new Error("base can only be used when target is base.");
   }
@@ -204,18 +397,30 @@ async function review({ cwd, target = "uncommitted", base, commit, prompt }) {
   if (target !== "uncommitted" && ref === undefined) {
     throw new Error(`${target} is required when target is ${target}.`);
   }
+  const args = ["exec", "-s", "read-only", "review"];
   if (prompt !== undefined) {
-    const header = ref === undefined ? target : `${target} ${ref}`;
-    return commandOutput(await runCodex(["review", "-"], { cwd, input: `Target: ${header}\n\n${prompt}` }));
+    let header = target;
+    if (ref !== undefined) {
+      try {
+        const { stdout } = await runCommand("git", ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], {
+          cwd, signal, label: "Git"
+        });
+        header += ` ${stdout.trim()}`;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error(`Cannot resolve Git ref ${JSON.stringify(ref)} to a commit. ${error.message}`, { cause: error });
+      }
+    }
+    return commandOutput(await runCodex([...args, "-"], { cwd, input: `Target: ${header}\n\n${prompt}`, signal }));
   }
-  const args = ["review", `--${target}`];
+  args.push(`--${target}`);
   if (ref !== undefined) {
     args.push(ref);
   }
-  return commandOutput(await runCodex(args, { cwd }));
+  return commandOutput(await runCodex(args, { cwd, signal }));
 }
 
-async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral }) {
+async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral }, signal) {
   const args = ["exec", "--json", "-s", sandbox, "-C", cwd];
   if (model !== undefined) {
     args.push("-m", model);
@@ -226,12 +431,12 @@ async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephem
   if (ephemeral) {
     args.push("--ephemeral");
   }
-  const { stdout } = await runCodex([...args, "-"], { input: prompt });
-  return JSON.stringify(parseExecOutput(stdout));
+  const { result } = await runCodex([...args, "-"], { input: prompt, signal, jsonl: true });
+  return JSON.stringify(result);
 }
 
-async function resume({ cwd, prompt, sessionId }) {
-  const args = ["exec", "resume", "--json"];
+async function resume({ cwd, prompt, sessionId, sandbox = "read-only" }, signal) {
+  const args = ["exec", "-s", sandbox, "resume", "--json"];
   if (sessionId === undefined) {
     args.push("--last");
   } else {
@@ -241,21 +446,21 @@ async function resume({ cwd, prompt, sessionId }) {
     }
     args.push(sessionId);
   }
-  const { stdout } = await runCodex([...args, "-"], { cwd, input: prompt });
-  return JSON.stringify(parseExecOutput(stdout));
+  const { result } = await runCodex([...args, "-"], { cwd, input: prompt, signal, jsonl: true });
+  return JSON.stringify(result);
 }
 
-async function doctor({ cwd }) {
-  const version = await runCodex(["--version"], { cwd });
+async function doctor({ cwd }, signal) {
+  const version = await runCodex(["--version"], { cwd, signal });
   let report;
   try {
-    report = await runCodex(["doctor", "--summary"], { cwd });
+    report = await runCodex(["doctor", "--summary"], { cwd, signal });
   } catch (error) {
     const unsupportedSummary = /\b(?:unexpected|unknown|unrecognized|unsupported)\s+(?:argument|option|flag)s?[\s:'"`]*--summary\b/i;
     if (!unsupportedSummary.test(error.message)) {
       throw error;
     }
-    report = await runCodex(["doctor"], { cwd });
+    report = await runCodex(["doctor"], { cwd, signal });
   }
   return [commandOutput(version), commandOutput(report)].filter(Boolean).join("\n\n");
 }
@@ -264,10 +469,11 @@ function toolResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
 
-async function callTool(tool, args = {}) {
+async function callTool(tool, args = {}, signal) {
   try {
     await validateArguments(args, tool.inputSchema);
-    return toolResult(await tool.run(args));
+    signal.throwIfAborted();
+    return toolResult(await tool.run(args, signal));
   } catch (error) {
     return toolResult(error.message, true);
   }
@@ -282,7 +488,7 @@ function rpcError(id, code, message) {
 }
 
 async function handleLine(line) {
-  if (!line.trim()) {
+  if (shuttingDown || !line.trim()) {
     return;
   }
   let request;
@@ -299,6 +505,9 @@ async function handleLine(line) {
 
   const { id, method, params } = request;
   if (id === undefined) {
+    if (method === "notifications/cancelled" && isObject(params)) {
+      activeCalls.get(params.requestId)?.abort();
+    }
     return;
   }
   if (typeof id !== "string" && !Number.isFinite(id)) {
@@ -319,7 +528,9 @@ async function handleLine(line) {
       }
       respond(id, {
         result: {
-          protocolVersion,
+          protocolVersion: supportedProtocolVersions.includes(protocolVersion)
+            ? protocolVersion
+            : supportedProtocolVersions[0],
           capabilities: { tools: {} },
           serverInfo: { name: "codex-cli", version: "0.2.0" }
         }
@@ -340,7 +551,19 @@ async function handleLine(line) {
         rpcError(id, -32602, "Unknown or missing tool name");
         return;
       }
-      respond(id, { result: await callTool(tool, params.arguments) });
+      if (activeCalls.has(id)) {
+        return;
+      }
+      const controller = new AbortController();
+      activeCalls.set(id, controller);
+      try {
+        const result = await callTool(tool, params.arguments, controller.signal);
+        if (!controller.signal.aborted) {
+          respond(id, { result });
+        }
+      } finally {
+        activeCalls.delete(id);
+      }
       break;
     }
     default:
@@ -350,19 +573,20 @@ async function handleLine(line) {
 
 let shuttingDown = false;
 
-function shutdown(exitCode) {
+async function shutdown(exitCode) {
   if (shuttingDown) {
     return;
   }
   shuttingDown = true;
-  for (const child of activeChildren) {
-    child.kill();
+  for (const controller of activeCalls.values()) {
+    controller.abort();
   }
+  await Promise.allSettled([...activeChildren].map((terminate) => terminate()));
   process.exit(exitCode);
 }
 
-process.once("SIGINT", () => shutdown(130));
-process.once("SIGTERM", () => shutdown(143));
+process.on("SIGINT", () => shutdown(130));
+process.on("SIGTERM", () => shutdown(143));
 process.stdout.on("error", () => shutdown(1));
 
 const input = createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity });

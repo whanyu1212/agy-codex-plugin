@@ -110,25 +110,28 @@ agy plugin list
 
 ## MCP Tools (`mcp_config.json`)
 
-Antigravity starts the bundled `codex` stdio server using [`mcp_config.json`](mcp_config.json). The server runs on Node.js built-ins and needs no `npm install`. It uses the `codex` executable on `PATH`.
+Antigravity starts the bundled `codex` stdio server using [`mcp_config.json`](mcp_config.json). The server runs on Node.js built-ins and uses Codex from `PATH`. On Windows it prefers `codex.exe` and can also run the JavaScript entrypoint of an npm-generated `codex.cmd` shim.
 
 | Tool | Inputs | Result |
 | :--- | :--- | :--- |
 | `codex_review` | Required `cwd`. Optional `target` defaults to `uncommitted`. Use `base` with `target: "base"` or `commit` with `target: "commit"`. An optional `prompt` supplies custom review instructions. | Read-only review output. |
 | `codex_exec` | Required `cwd` and `prompt`. Optional `sandbox` defaults to `read-only` and also accepts `workspace-write`. Optional `model`, `worktree`, and `ephemeral`. | JSON text with `sessionId` and `finalMessage`. |
-| `codex_resume` | Required `cwd` and `prompt`. Optional `sessionId` selects a session. Omit it to resume the most recent session in `cwd`. | JSON text with `sessionId` and `finalMessage`. |
+| `codex_resume` | Required `cwd` and `prompt`. Optional `sessionId` selects a session by ID or name. Omit it to select the most recent session in `cwd`. Optional `sandbox` defaults to `read-only` and also accepts `workspace-write`. | JSON text with `sessionId` and `finalMessage`. |
 | `codex_doctor` | Optional `cwd`. | Codex version and local diagnostic output. |
 
-With a custom review `prompt`, the server includes the selected target in the instructions sent to Codex. Use either `worktree` or `ephemeral` for an exec call because Codex rejects the combination. Ephemeral sessions are available only for the duration of the call.
+With a custom review `prompt`, the server includes the selected target in the instructions sent to Codex. It uses Git in `cwd` to resolve a base or commit ref to a full commit SHA and returns a tool error if the ref cannot be resolved. Use either `worktree` or `ephemeral` for an exec call because Codex rejects the combination. Ephemeral sessions are available only for the duration of the call.
+
+Codex 0.171.0 returns an error for a missing session UUID. An unknown thread name or an empty `--last` selection starts a new session. Use the returned `sessionId` to identify the session used for the turn.
 
 ### How the MCP Server Works
 
-[`scripts/mcp-server.mjs`](scripts/mcp-server.mjs) speaks newline-delimited JSON-RPC 2.0 over `stdin`/`stdout` using only Node.js built-ins:
+[`scripts/mcp-server.mjs`](scripts/mcp-server.mjs) speaks newline-delimited JSON-RPC 2.0 over `stdin`/`stdout`. It supports MCP versions `2025-06-18` and `2024-11-05` and offers `2025-06-18` when the client requests an unsupported version.
 
-1. **Direct subprocess spawning (no shell):** Every tool call validates JSON arguments against its schema and spawns `codex` with an explicit argument array (`spawn("codex", args)`), passing prompts over `stdin` and keeping all diagnostics off `stdout`.
-2. **Automatic flag adaptation:** Because `codex review` forbids combining `--uncommitted`/`--base`/`--commit` with a custom prompt, `codex_review` switches to `codex review -` with a `Target:` header when `prompt` is provided.
-3. **Structured JSONL extraction:** `codex_exec` and `codex_resume` run `codex exec --json` and parse the event stream into `{ sessionId, finalMessage }`, discarding intermediate progress chatter.
-4. **Responsive lifecycle handling:** The server continues reading `stdin` while `codex` runs (so `ping` requests still succeed) and terminates any active `codex` child processes when `stdin` closes or on `SIGINT`, `SIGTERM`, or `stdout` errors.
+1. The server validates tool arguments, launches subprocesses with argument arrays, and passes prompts over `stdin`.
+2. Reviews run through `codex exec -s read-only review`. Codex accepts a custom prompt or a target flag in a single review, so the custom prompt path uses `review -` with a `Target:` header.
+3. Exec and resume parse JSONL incrementally and return `{ sessionId, finalMessage }`. Structured output without an agent message returns `finalMessage: null`. Plain stdout is used when Codex emits no JSONL events.
+4. The server retains up to 1 MiB per output stream for plain output and diagnostics, skips JSONL lines over 1 MiB, and returns `[output truncated]` for an oversized final agent message. It drains inherited pipes for up to 250 ms after the subprocess exits.
+5. The server answers `ping` while a tool runs. An MCP cancellation terminates the associated subprocess and suppresses its reply. Shutdown also cleans up active subprocesses when `stdin` closes or on `SIGINT`, `SIGTERM`, or `stdout` errors. On Unix, cleanup signals the process group and escalates to `SIGKILL` after 500 ms if needed. On Windows, cleanup uses `taskkill.exe` for the process tree and falls back to terminating the direct subprocess if it is still running.
 
 ### Why MCP Over v0.1 CLI Skills (and When to Use Each)
 
@@ -136,9 +139,9 @@ v0.1 invoked `codex` solely through shell commands (`run_command`). Adding the M
 
 | Dimension | v0.1 CLI Skills (`run_command`) | v0.2 MCP Server (`mcp_config.json`) |
 | :--- | :--- | :--- |
-| **Permissions** | Requires approving shell commands | Separates read-only (`codex_review`, `codex_doctor`) from write (`codex_exec`, `codex_resume`) without broad shell access |
+| **Permissions** | Requires approving shell commands | Reviews use `read-only`. Exec and resume default to `read-only` and accept `workspace-write` explicitly. |
 | **Prompt passing** | Relies on shell heredocs (`<<'EOF'`) | Typed JSON inputs passed directly to `stdin` with zero shell-escaping bugs |
-| **Context usage** | Full CLI stdout enters conversation context | Strips JSONL noise and returns `{ sessionId, finalMessage }` |
+| **Context usage** | Full CLI stdout enters conversation context | Extracts the session ID and final message from JSONL |
 | **Session continuity** | `codex exec resume --last` can collide across parallel tasks | Returns an explicit `sessionId` for `codex_resume` |
 | **Background execution** | Native `run_command` detachment + reactive wakeup | Synchronous tool call (pair with `codex-delegate` or `/codex-*` skills for long-running background jobs) |
 
