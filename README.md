@@ -121,6 +121,29 @@ Antigravity starts the bundled `codex` stdio server using [`mcp_config.json`](mc
 
 With a custom review `prompt`, the server includes the selected target in the instructions sent to Codex. Use either `worktree` or `ephemeral` for an exec call because Codex rejects the combination. Ephemeral sessions are available only for the duration of the call.
 
+### How the MCP Server Works
+
+[`scripts/mcp-server.mjs`](scripts/mcp-server.mjs) speaks newline-delimited JSON-RPC 2.0 over `stdin`/`stdout` using only Node.js built-ins:
+
+1. **Direct subprocess spawning (no shell):** Every tool call validates JSON arguments against its schema and spawns `codex` with an explicit argument array (`spawn("codex", args)`), passing prompts over `stdin` and keeping all diagnostics off `stdout`.
+2. **Automatic flag adaptation:** Because `codex review` forbids combining `--uncommitted`/`--base`/`--commit` with a custom prompt, `codex_review` switches to `codex review -` with a `Target:` header when `prompt` is provided.
+3. **Structured JSONL extraction:** `codex_exec` and `codex_resume` run `codex exec --json` and parse the event stream into `{ sessionId, finalMessage }`, discarding intermediate progress chatter.
+4. **Responsive lifecycle handling:** The server continues reading `stdin` while `codex` runs (so `ping` requests still succeed) and terminates any active `codex` child processes on `SIGINT`, `SIGTERM`, or `stdout` errors.
+
+### Why MCP Over v0.1 CLI Skills (and When to Use Each)
+
+v0.1 invoked `codex` solely through shell commands (`run_command`). Adding the MCP server in v0.2 improves reliability, safety, and token efficiency:
+
+| Dimension | v0.1 CLI Skills (`run_command`) | v0.2 MCP Server (`mcp_config.json`) |
+| :--- | :--- | :--- |
+| **Permissions** | Requires approving shell commands | Separates read-only (`codex_review`, `codex_doctor`) from write (`codex_exec`, `codex_resume`) without broad shell access |
+| **Prompt passing** | Relies on shell heredocs (`<<'EOF'`) | Typed JSON inputs passed directly to `stdin` with zero shell-escaping bugs |
+| **Context usage** | Full CLI stdout enters conversation context | Strips JSONL noise and returns `{ sessionId, finalMessage }` |
+| **Session continuity** | `codex exec resume --last` can collide across parallel tasks | Returns an explicit `sessionId` for `codex_resume` |
+| **Background execution** | Native `run_command` detachment + reactive wakeup | Synchronous tool call (pair with `codex-delegate` or `/codex-*` skills for long-running background jobs) |
+
+Use the **MCP tools** for structured, token-efficient, or permission-scoped invocations across Antigravity CLI, App, and IDE; keep using **`/codex-*` skills** when you want explicit slash-command workflows or native `run_command` background wakeup on long tasks.
+
 ## Optional Stop Review Gate (`hooks.json`)
 
 The plugin ships with an **opt-in** `Stop` hook (`codex-stop-review-gate`) powered by [`scripts/stop-review-gate.mjs`](scripts/stop-review-gate.mjs). When enabled, it runs `codex exec -s read-only --ephemeral` on uncommitted changes before Antigravity ends a turn and continues the loop if Codex reports concrete bugs, regressions, or security issues.
