@@ -1,0 +1,21 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "codex-cli",
+  "displayName": "Codex CLI",
+  "version": "0.1.0",
+  "description": "Run read-only code reviews, adversarial challenge reviews, and delegated tasks using your local OpenAI Codex CLI.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Run a Codex review on my uncommitted changes",
+    "Run an adversarial Codex review against main",
+    "Check my local Codex CLI setup and authentication"
+  ],
+  "author": {
+    "name": "whanyu1212",
+    "url": "https://github.com/whanyu1212"
+  },
+  "homepage": "https://github.com/whanyu1212/agy-codex-plugin",
+  "repository": "https://github.com/whanyu1212/agy-codex-plugin",
+  "license": "MIT",
+  "keywords": ["codex", "openai", "code-review", "multi-agent", "cli"]
+}
