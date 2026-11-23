@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
-const canonicalRoot = fs.realpathSync.native(root);
+const rootDir = fileURLToPath(root);
+const canonicalRoot = fs.realpathSync.native(rootDir);
+const canonicalRootPrefix = canonicalRoot.endsWith(path.sep) ? canonicalRoot : `${canonicalRoot}${path.sep}`;
 
 function readText(file) {
   return fs.readFileSync(new URL(file, root), "utf8");
@@ -15,11 +18,19 @@ function assertNonEmptyString(value, field) {
 }
 
 function assertPackagedFile(file) {
-  const target = new URL(file, root);
-  assert.ok(target.href.startsWith(root.href), `${file} must be inside the plugin`);
+  assertNonEmptyString(file, "packaged file path");
+  assert.ok(!path.isAbsolute(file) && !path.win32.isAbsolute(file), `${file} must be a relative path`);
+  assert.ok(!file.includes("\\") && !/^[A-Za-z]:/.test(file), `${file} must use POSIX relative path separators`);
+  assert.ok(!/[\0?#]/.test(file), `${file} must not contain null bytes, queries, or fragments`);
+  const target = path.resolve(rootDir, file);
+  const rel = path.relative(rootDir, target);
+  assert.ok(
+    rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel),
+    `${file} must be inside the plugin`,
+  );
   assert.ok(fs.statSync(target, { throwIfNoEntry: false })?.isFile(), `${file} must exist as a file`);
   const canonicalFile = fs.realpathSync.native(target);
-  assert.ok(canonicalFile.startsWith(`${canonicalRoot}${path.sep}`), `${file} must resolve inside the plugin`);
+  assert.ok(canonicalFile.startsWith(canonicalRootPrefix), `${file} must resolve inside the plugin`);
 }
 
 function readFrontmatter(file) {
@@ -60,11 +71,14 @@ function readFrontmatter(file) {
   return fields;
 }
 
-test("packages the plugin logo", () => {
+test("packages the plugin manifest", () => {
   const plugin = JSON.parse(readText("plugin.json"));
   for (const field of ["name", "version", "description", "logo"]) {
     assertNonEmptyString(plugin[field], `plugin.json ${field}`);
   }
+  assert.equal(plugin.name, "codex-cli", "plugin.json name must match installed plugin path");
+  assert.notEqual(plugin.disabled, true, "plugin.json must not disable the plugin by default");
+  assert.ok(/\.(?:svg|png|jpe?g|webp)$/i.test(plugin.logo), "plugin.json logo must be an image file");
   assertPackagedFile(plugin.logo);
 });
 
@@ -82,13 +96,20 @@ test("packages the MCP server", () => {
 
 test("packages the opt-in hook", () => {
   const hooks = JSON.parse(readText("hooks.json"));
+  assert.ok(hooks && typeof hooks === "object" && !Array.isArray(hooks), "hooks.json must be an object");
+  for (const [name, group] of Object.entries(hooks)) {
+    assert.ok(group && typeof group === "object" && !Array.isArray(group), `hook group ${name} must be an object`);
+    assert.equal(group.enabled, false, `hook group ${name} must remain disabled by default`);
+  }
   const gate = hooks["codex-stop-review-gate"];
-  assert.equal(gate?.enabled, false);
-  const command = gate.Stop?.find((entry) => entry.type === "command")?.command;
-  assertNonEmptyString(command, "Stop review gate command");
-  const script = /^node (\.\/scripts\/[^\s]+)$/.exec(command);
-  assert.ok(script, "Stop review gate must run a script in ./scripts/");
-  assertPackagedFile(script[1]);
+  assert.ok(gate, "hooks.json must define codex-stop-review-gate");
+  assert.ok(Array.isArray(gate.Stop) && gate.Stop.length === 1, "Stop review gate must define exactly one handler");
+  const [handler] = gate.Stop;
+  assert.ok(handler && typeof handler === "object" && !Array.isArray(handler), "Stop review gate handler must be an object");
+  assert.equal(handler.type, "command", "Stop review gate handler type must be command");
+  assert.equal(handler.command, "node ./scripts/stop-review-gate.mjs", "Stop review gate must invoke ./scripts/stop-review-gate.mjs");
+  assert.ok(Number.isInteger(handler.timeout) && handler.timeout >= 250, "Stop review gate timeout must be an integer >= 250 seconds");
+  assertPackagedFile("./scripts/stop-review-gate.mjs");
 });
 
 test("validates delegate frontmatter", () => {
