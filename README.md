@@ -8,7 +8,7 @@ A zero-dependency **Antigravity (`agy`)** plugin for delegating code reviews, ad
 
 - **OpenAI Codex CLI** (`codex`) installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated (`codex login`)
 - **Antigravity** (`agy` CLI, Antigravity App, or Antigravity IDE)
-- **Node.js 22+** on `PATH` (for the bundled MCP server and optional Stop hook)
+- **Node.js 22+** on `PATH` (for the bundled CLI runner, MCP server, and optional Stop hook)
 
 ### Install
 
@@ -36,7 +36,7 @@ agy plugin list
 | `/codex-rescue` | Delegate diagnosis (`read-only`), fixes (`workspace-write`), or follow-ups | `/codex-rescue diagnose why tests/auth.test.ts is flaky` |
 | `/codex-setup` | Check `codex` binary, version, and authentication health | `/codex-setup` |
 
-> **Tip:** `/codex-rescue` supports `workspace-write` (and `--worktree` for isolated edits) as well as `resume --last` to continue prior work. For faster bounded CLI runs, pass `-c model_reasoning_effort=medium` after `codex exec`.
+The skills run [`scripts/codex-run.mjs`](scripts/codex-run.mjs) for background work. Use `node /path/to/plugin/scripts/codex-run.mjs` with `review`, `exec`, `resume`, or `doctor` from your repository. For bounded runs, pass `--effort medium`. To continue the most recent session, run `resume` with the follow-up prompt on stdin.
 
 ## MCP Tools
 
@@ -53,6 +53,7 @@ Common options & notes:
 - `effort`: optional `low`, `medium`, or `high` on `codex_review`, `codex_exec`, and `codex_resume`.
 - `timeoutMs`: optional integer from `1000` to `1800000` ms (defaults: 10 minutes for review/exec/resume, 1 minute for doctor).
 - `worktree` requires `sandbox: "workspace-write"` and cannot be combined with `ephemeral` on `codex_exec`.
+- Set `params._meta.progressToken` on `codex_exec` or `codex_resume` calls to receive session and throttled item updates via `notifications/progress`.
 
 **When to use MCP tools vs. slash commands:** Use MCP tools for structured, token-efficient, session-tracked invocations across Antigravity CLI, App, and IDE; use `/codex-*` skills or `codex-delegate` when you want explicit slash workflows or background wakeup on long-running tasks.
 
@@ -72,7 +73,7 @@ Run `agy plugin install .` after edits to refresh the locally installed plugin.
 
 ```bash
 # Run unit tests (uses a fake codex fixture on PATH)
-node --test tests/manifest.test.mjs tests/stop-review-gate.test.mjs tests/mcp-server.test.mjs
+node --test tests/manifest.test.mjs tests/codex-run.test.mjs tests/stop-review-gate.test.mjs tests/mcp-server.test.mjs
 
 # Strictly validate the plugin manifest and MCP server registration
 agy plugin validate --strict .

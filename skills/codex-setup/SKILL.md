@@ -12,10 +12,14 @@ Verify the local `codex` CLI installation, version, and authentication state.
 
 ## Steps
 
-1. **Run a local diagnostic check** via `run_command`:
+1. **Run a local diagnostic check** with the `codex_doctor` MCP tool, or use
+   `run_command` with the bundled runner. Resolve `<plugin-root>` two levels
+   up from the directory containing this `SKILL.md`.
    ```bash
-   which codex && codex --version && codex doctor
+   node "<plugin-root>/scripts/codex-run.mjs" doctor
    ```
+   If the runner is unavailable, use `codex --version && codex doctor --summary`.
+   If Codex reports an unsupported `--summary` option, retry with `codex doctor`.
 
 2. **Interpret the result**:
    - **If `codex` is not found on `PATH`**, provide installation commands and
