@@ -10,15 +10,18 @@ Instead of shipping a custom background daemon, a JSON-RPC app-server client, or
 - **Reactive `run_command` background wakeup** lets long-running `codex` runs execute asynchronously and wake Antigravity up when finished—no `/status`, `/result`, or `/cancel` polling needed.
 - **Custom subagent (`codex-delegate`)** lets Antigravity delegate second opinions or isolated Codex runs in the background.
 - **Native `Stop` hook (`hooks.json`)** optionally checks uncommitted changes before Antigravity finishes a turn, using `continuationActive` to prevent loops and failing open on errors.
+- **Bundled stdio MCP server (`mcp_config.json`)** exposes Codex review, exec, resume, and diagnostics as typed tools with zero npm dependencies.
 
 ```mermaid
 flowchart LR
     U["User / Antigravity Session"] --> S["Skills (/codex-review, /codex-adversarial, /codex-rescue, /codex-setup)"]
     U --> A["Subagent (codex-delegate)"]
     U --> H["Opt-in Stop Hook (scripts/stop-review-gate.mjs)"]
+    U --> M["MCP Server (scripts/mcp-server.mjs)"]
     S --> C["Local Codex CLI (codex review / codex exec / codex doctor)"]
     A --> C
     H --> C
+    M --> C
     C --> R["Local Git Repository"]
 ```
 
@@ -27,6 +30,7 @@ flowchart LR
 ```text
 agy-codex-plugin/
 ├── plugin.json                        # Antigravity plugin manifest (name: codex-cli)
+├── mcp_config.json                    # Bundled Codex MCP server registration
 ├── README.md
 ├── LICENSE                            # MIT
 ├── assets/
@@ -40,9 +44,11 @@ agy-codex-plugin/
 │   └── codex-delegate.md              # Background subagent wrapper around codex CLI
 ├── hooks.json                         # Opt-in Stop review gate (disabled by default)
 ├── scripts/
+│   ├── mcp-server.mjs                 # Zero-dependency Node ESM stdio MCP server
 │   └── stop-review-gate.mjs           # Zero-dependency Node ESM Stop hook
 └── tests/
-    └── stop-review-gate.test.mjs      # Deterministic unit tests with fake codex stub
+    ├── mcp-server.test.mjs            # MCP protocol and Codex invocation tests
+    └── stop-review-gate.test.mjs      # Stop hook tests
 ```
 
 ## Prerequisites
@@ -58,7 +64,7 @@ agy-codex-plugin/
    codex login
    ```
 2. **Antigravity** (`agy` CLI, Antigravity App, or Antigravity IDE).
-3. **Node.js** (only required if you enable the optional `Stop` hook).
+3. **Node.js** on `PATH` for the bundled MCP server and the optional `Stop` hook.
 
 ## Installation
 
@@ -102,6 +108,19 @@ agy plugin list
 
 [`agents/codex-delegate.md`](agents/codex-delegate.md) registers a lightweight `flash` background subagent (`subagent: true`, `mainAgent: false`) so Antigravity can offload a second opinion, review, or `codex exec` run without blocking your main conversation.
 
+## MCP Tools (`mcp_config.json`)
+
+Antigravity starts the bundled `codex` stdio server using [`mcp_config.json`](mcp_config.json). The server runs on Node.js built-ins and needs no `npm install`. It uses the `codex` executable on `PATH`.
+
+| Tool | Inputs | Result |
+| :--- | :--- | :--- |
+| `codex_review` | Required `cwd`. Optional `target` defaults to `uncommitted`. Use `base` with `target: "base"` or `commit` with `target: "commit"`. An optional `prompt` supplies custom review instructions. | Read-only review output. |
+| `codex_exec` | Required `cwd` and `prompt`. Optional `sandbox` defaults to `read-only` and also accepts `workspace-write`. Optional `model`, `worktree`, and `ephemeral`. | JSON text with `sessionId` and `finalMessage`. |
+| `codex_resume` | Required `cwd` and `prompt`. Optional `sessionId` selects a session. Omit it to resume the most recent session in `cwd`. | JSON text with `sessionId` and `finalMessage`. |
+| `codex_doctor` | Optional `cwd`. | Codex version and local diagnostic output. |
+
+With a custom review `prompt`, the server includes the selected target in the instructions sent to Codex. Use either `worktree` or `ephemeral` for an exec call because Codex rejects the combination. Ephemeral sessions are available only for the duration of the call.
+
 ## Optional Stop Review Gate (`hooks.json`)
 
 The plugin ships with an **opt-in** `Stop` hook (`codex-stop-review-gate`) powered by [`scripts/stop-review-gate.mjs`](scripts/stop-review-gate.mjs). When enabled, it runs `codex exec -s read-only --ephemeral` on uncommitted changes before Antigravity ends a turn and continues the loop if Codex reports concrete bugs, regressions, or security issues.
@@ -117,10 +136,10 @@ To enable it, set `"enabled": true` in `hooks.json` inside your installed plugin
 ## Development & Testing
 
 ```bash
-# Run deterministic Stop hook unit tests (uses a fake codex stub on PATH)
-node --test tests/stop-review-gate.test.mjs
+# Run deterministic tests with a fake codex on PATH
+node --test tests/stop-review-gate.test.mjs tests/mcp-server.test.mjs
 
-# Validate manifest, skills, subagent, and hooks strictly
+# Validate the plugin, including the MCP server registration
 agy plugin validate --strict .
 ```
 
