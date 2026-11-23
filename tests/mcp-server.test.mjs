@@ -116,7 +116,7 @@ if (mode === "lingering-pipe") {
   const descendant = spawn(
     process.execPath,
     ["-e", 'setInterval(() => {}, 60_000); process.send("ready");'],
-    { stdio: ["ignore", "inherit", "inherit", "ipc"], detached: true, windowsHide: true }
+    { cwd: require("node:os").tmpdir(), stdio: ["ignore", "inherit", "inherit", "ipc"], detached: true, windowsHide: true }
   );
   invocation.descendantPid = descendant.pid;
   const onEarlyExit = (code, signal) => {
@@ -137,7 +137,10 @@ if (mode === "lingering-pipe") {
     'setInterval(() => {}, 60_000);',
     'process.send("ready");'
   ].join("\n");
-  const descendant = spawn(process.execPath, ["-e", code, log], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  const descendant = spawn(process.execPath, ["-e", code, log], {
+    cwd: require("node:os").tmpdir(),
+    stdio: ["ignore", "ignore", "ignore", "ipc"]
+  });
   invocation.descendantPid = descendant.pid;
   descendant.once("message", () => {
     descendant.disconnect();
