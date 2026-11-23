@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import process from "node:process";
+import { runCodex } from "./codex-command.mjs";
 
 const CODEX_TIMEOUT_MS = 240_000;
 
@@ -64,7 +65,7 @@ function parseVerdict(output) {
   return null;
 }
 
-function main() {
+async function main() {
   const input = readStdinJson();
   if (!input || input.continuationActive === true || input.terminationReason !== "NO_TOOL_CALL") {
     allowStop();
@@ -84,19 +85,40 @@ function main() {
     'Respond with a single final JSON line and nothing else after it: {"block": false, "summary": ""} or {"block": true, "summary": "<concise list of blocking issues with file paths>"}.'
   ].join("\n");
 
-  const result = spawnSync(
-    "codex",
-    ["exec", "-s", "read-only", "--ephemeral", "-C", cwd, "-"],
-    {
+  const args = ["exec", "-s", "read-only", "--ephemeral", "-C", cwd, "-"];
+  const controller = new AbortController();
+  const shutdownSignals = ["SIGINT", "SIGTERM"];
+  let interruptedBy;
+  const interrupt = (signal) => {
+    interruptedBy ??= signal;
+    controller.abort();
+  };
+  for (const signal of shutdownSignals) {
+    process.on(signal, interrupt);
+  }
+  const timer = setTimeout(() => controller.abort(), CODEX_TIMEOUT_MS).unref();
+  let result;
+  try {
+    result = await runCodex(args, {
       input: prompt,
-      encoding: "utf8",
-      timeout: CODEX_TIMEOUT_MS,
-      stdio: ["pipe", "pipe", "ignore"]
+      signal: controller.signal,
+      ignoreStderr: true,
+      failOnTruncatedOutput: true
+    }).catch(() => null);
+  } finally {
+    clearTimeout(timer);
+    for (const signal of shutdownSignals) {
+      process.off(signal, interrupt);
     }
-  );
+  }
+  if (interruptedBy) {
+    // Preserve the hook's signal exit after its detached child is gone.
+    process.kill(process.pid, interruptedBy);
+    return;
+  }
 
   // Fail open if codex is missing, timed out, or errored.
-  if (result.error || result.status !== 0 || !result.stdout) {
+  if (!result?.stdout) {
     allowStop();
     return;
   }
@@ -116,4 +138,4 @@ function main() {
   allowStop();
 }
 
-main();
+await main();

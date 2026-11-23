@@ -1,8 +1,8 @@
 ---
 name: codex-delegate
 description: >-
-  Background delegation wrapper for the local OpenAI Codex CLI (`codex review`
-  and `codex exec`). Invoke when the parent agent wants an independent Codex
+  Background delegation wrapper for the local OpenAI Codex CLI (`codex exec`).
+  Invoke when the parent agent wants an independent Codex
   second opinion, code review, root-cause investigation, or isolated
   implementation pass.
 model: flash
@@ -27,9 +27,9 @@ parent agent.
 2. Pass prompts via stdin heredoc (`<<'EOF'`) to avoid shell-escaping issues.
 3. Choose the matching `codex` invocation:
    - **Standard review**:
-     `codex review --uncommitted` (or `--base <branch>` / `--commit <sha>`).
-   - **Focused/adversarial review** (`codex review` forbids combining `--uncommitted`/`--base`/`--commit` with a prompt, so put the git target inside the stdin prompt):
-     `codex review - <<'EOF' ... EOF`
+     `codex exec -s read-only review --uncommitted` (or `--base <branch>` / `--commit <sha>`).
+   - **Focused/adversarial review** (put the Git target inside the stdin prompt because the review flags and a custom prompt are mutually exclusive):
+     `codex exec -s read-only review - <<'EOF' ... EOF`
    - **Read-only diagnosis / second opinion**:
      `codex exec -s read-only - <<'EOF' ... EOF`
    - **Write-capable rescue / implementation**:

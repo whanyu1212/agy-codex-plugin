@@ -1,22 +1,23 @@
 #!/usr/bin/env node
 
-import { execFile, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
-import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
-import { setTimeout as delay } from "node:timers/promises";
+import {
+  boundedOutput, cleanOutput, runCodex, runCommand, terminateActiveCommands, truncationMarker, withAbort
+} from "./codex-command.mjs";
 
 const cwdProperty = { type: "string", minLength: 1, description: "Working directory for Codex." };
 const promptProperty = { type: "string", minLength: 1, description: "Prompt to send to Codex on stdin." };
 const sandboxProperty = { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" };
+const effortProperty = {
+  type: "string", enum: ["low", "medium", "high"], description: "Override Codex model reasoning effort."
+};
+const timeoutProperty = {
+  type: "integer", minimum: 1_000, maximum: 1_800_000, default: 600_000,
+  description: "Time limit in milliseconds for the tool's commands."
+};
 const supportedProtocolVersions = ["2025-06-18", "2024-11-05"];
-const outputLimit = 1024 * 1024;
-const truncationMarker = "[output truncated]";
-const pipeDrainMs = 250;
-const terminationGraceMs = 500;
-const useProcessGroups = process.platform !== "win32";
-const activeChildren = new Set();
 const activeCalls = new Map();
 
 const tools = [
@@ -30,7 +31,9 @@ const tools = [
         target: { type: "string", enum: ["uncommitted", "base", "commit"], default: "uncommitted" },
         base: { type: "string", minLength: 1, description: "Required when target is base." },
         commit: { type: "string", minLength: 1, description: "Required when target is commit." },
-        prompt: promptProperty
+        prompt: promptProperty,
+        effort: effortProperty,
+        timeoutMs: timeoutProperty
       },
       required: ["cwd"],
       allOf: [
@@ -58,7 +61,9 @@ const tools = [
         sandbox: sandboxProperty,
         model: { type: "string", minLength: 1 },
         worktree: { type: "boolean", description: "Run in a new managed Git worktree." },
-        ephemeral: { type: "boolean", description: "Run without persisting session files." }
+        ephemeral: { type: "boolean", description: "Run without persisting session files." },
+        effort: effortProperty,
+        timeoutMs: timeoutProperty
       },
       required: ["cwd", "prompt"],
       additionalProperties: false
@@ -75,7 +80,9 @@ const tools = [
         cwd: cwdProperty,
         prompt: promptProperty,
         sessionId: { type: "string", minLength: 1, description: "Session to resume. Omit to use --last." },
-        sandbox: sandboxProperty
+        sandbox: sandboxProperty,
+        effort: effortProperty,
+        timeoutMs: timeoutProperty
       },
       required: ["cwd", "prompt"],
       additionalProperties: false
@@ -87,7 +94,7 @@ const tools = [
     description: "Show the installed Codex version and local diagnostic results.",
     inputSchema: {
       type: "object",
-      properties: { cwd: cwdProperty },
+      properties: { cwd: cwdProperty, timeoutMs: { ...timeoutProperty, default: 60_000 } },
       additionalProperties: false
     },
     run: doctor
@@ -98,7 +105,7 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-async function validateArguments(args, schema) {
+function validateArguments(args, schema) {
   if (!isObject(args)) {
     throw new Error("Tool arguments must be an object.");
   }
@@ -112,8 +119,10 @@ async function validateArguments(args, schema) {
       throw new Error(`Unknown argument: ${name}.`);
     }
     const property = schema.properties[name];
-    if (typeof value !== property.type) {
-      throw new Error(`${name} must be a ${property.type}.`);
+    const validType = property.type === "integer" ? Number.isInteger(value) : typeof value === property.type;
+    if (!validType) {
+      const typeName = property.type === "integer" ? "an integer" : `a ${property.type}`;
+      throw new Error(`${name} must be ${typeName}.`);
     }
     if (property.minLength && value.length < property.minLength) {
       throw new Error(`${name} must not be empty.`);
@@ -121,45 +130,23 @@ async function validateArguments(args, schema) {
     if (property.enum && !property.enum.includes(value)) {
       throw new Error(`${name} must be one of: ${property.enum.join(", ")}.`);
     }
-  }
-  if (args.cwd !== undefined) {
-    const info = await fs.stat(args.cwd).catch((error) => {
-      throw new Error(`Cannot access cwd ${JSON.stringify(args.cwd)}: ${error.message}`, { cause: error });
-    });
-    if (!info.isDirectory()) {
-      throw new Error(`cwd must be a directory: ${JSON.stringify(args.cwd)}.`);
+    if (property.minimum !== undefined && value < property.minimum) {
+      throw new Error(`${name} must be at least ${property.minimum}.`);
+    }
+    if (property.maximum !== undefined && value > property.maximum) {
+      throw new Error(`${name} must be at most ${property.maximum}.`);
     }
   }
 }
 
-function cleanOutput(text) {
-  return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").trim();
-}
-
-function boundedOutput() {
-  let buffer;
-  let size = 0;
-  let truncated = false;
-  return {
-    get truncated() { return truncated; },
-    append(chunk) {
-      const length = Math.min(chunk.length, outputLimit - size);
-      if (length > 0) {
-        if (size + length > (buffer?.length ?? 0)) {
-          const capacity = Math.min(outputLimit, Math.max(256, size + length, 2 * (buffer?.length ?? 0)));
-          const grown = Buffer.allocUnsafe(capacity);
-          buffer?.copy(grown, 0, 0, size);
-          buffer = grown;
-        }
-        chunk.copy(buffer, size, 0, length);
-        size += length;
-      }
-      truncated ||= length < chunk.length;
-    },
-    text() {
-      return (buffer?.toString("utf8", 0, size) ?? "") + (truncated ? `\n${truncationMarker}` : "");
-    }
-  };
+async function validateCwd(cwd, signal) {
+  const info = await withAbort(signal, () => fs.stat(cwd)).catch((error) => {
+    signal.throwIfAborted();
+    throw new Error(`Cannot access cwd ${JSON.stringify(cwd)}: ${error.message}`, { cause: error });
+  });
+  if (!info.isDirectory()) {
+    throw new Error(`cwd must be a directory: ${JSON.stringify(cwd)}.`);
+  }
 }
 
 function collectExecEvents() {
@@ -224,169 +211,15 @@ function collectExecEvents() {
   };
 }
 
-async function isFile(file) {
-  const stat = await fs.stat(file).catch(() => null);
-  return stat?.isFile() ?? false;
-}
-
-async function resolveWindowsCodex(args) {
-  const directories = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
-  for (const directory of directories) {
-    const executable = path.resolve(directory.replace(/^"|"$/g, ""), "codex.exe");
-    if (await isFile(executable)) {
-      return [executable, args];
-    }
-  }
-  for (const directory of directories) {
-    const shim = path.resolve(directory.replace(/^"|"$/g, ""), "codex.cmd");
-    const contents = await fs.readFile(shim, "utf8").catch(() => "");
-    // Read npm's generated Node entrypoint without evaluating the batch file.
-    const target = contents.match(/"%_prog%"[ \t]+"%dp0%\\([^"\r\n]+\.js)"[ \t]+%\*[ \t]*$/im)?.[1];
-    if (target) {
-      const entrypoint = path.resolve(path.dirname(shim), target);
-      if (await isFile(entrypoint)) {
-        return [process.execPath, [entrypoint, ...args]];
-      }
-    }
-  }
-  throw new Error("Could not start codex. Check PATH for codex.exe or an npm-generated codex.cmd.");
-}
-
-function signalGroup(pid, signal) {
-  if (useProcessGroups && pid !== undefined) {
-    try {
-      return process.kill(-pid, signal);
-    } catch (error) {
-      return signal === 0 && error.code === "EPERM";
-    }
-  }
-  return false;
-}
-
-async function waitForProcessTree(child, isRunning, graceMs) {
-  const deadline = performance.now() + graceMs;
-  while (isRunning() || signalGroup(child.pid, 0)) {
-    const remaining = deadline - performance.now();
-    if (remaining <= 0) {
-      return false;
-    }
-    await delay(Math.min(remaining, 25));
-  }
-  return true;
-}
-
-async function terminateProcessTree(child, isRunning) {
-  if (!useProcessGroups) {
-    if (isRunning()) {
-      // Killing the npm launcher alone would leave its native Codex subprocess running.
-      const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
-      const taskkill = path.join(systemRoot, "System32", "taskkill.exe");
-      const args = ["/PID", String(child.pid), "/T", "/F"];
-      await new Promise((done) => execFile(taskkill, args, { timeout: terminationGraceMs, windowsHide: true }, done));
-      if (isRunning()) {
-        child.kill("SIGKILL");
-        await waitForProcessTree(child, isRunning, pipeDrainMs);
-      }
-    }
-    return;
-  }
-  if (!signalGroup(child.pid, "SIGTERM") && isRunning()) {
-    child.kill("SIGTERM");
-  }
-  if (!await waitForProcessTree(child, isRunning, terminationGraceMs)) {
-    if (!signalGroup(child.pid, "SIGKILL") && isRunning()) {
-      child.kill("SIGKILL");
-    }
-    await waitForProcessTree(child, isRunning, pipeDrainMs);
-  }
-}
-
-function runCommand(command, args, { cwd, input, signal, jsonl, label }) {
-  signal.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd, stdio: ["pipe", "pipe", "pipe"], detached: useProcessGroups, windowsHide: true
-    });
-    const stdout = boundedOutput();
-    const stderr = boundedOutput();
-    const events = jsonl ? collectExecEvents() : undefined;
-    let running = child.pid !== undefined;
-    let settled = false;
-    let drainTimer;
-    let stdinError;
-    let spawnError;
-    let termination;
-    const terminate = () => termination ??= terminateProcessTree(child, () => running);
-
-    activeChildren.add(terminate);
-    signal.addEventListener("abort", terminate, { once: true });
-    child.stdout.on("data", (chunk) => {
-      stdout.append(chunk);
-      events?.append(chunk);
-    });
-    child.stderr.on("data", (chunk) => stderr.append(chunk));
-    child.stdin.on("error", (error) => { stdinError = error; });
-    child.on("error", (error) => {
-      spawnError = error;
-    });
-
-    function finish(code, exitSignal) {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(drainTimer);
-      const complete = () => {
-        activeChildren.delete(terminate);
-        signal.removeEventListener("abort", terminate);
-        signal.throwIfAborted();
-        const output = { stdout: stdout.text(), stderr: stderr.text() };
-        if (spawnError) {
-          const message = spawnError.code === "ENOENT"
-            ? `Could not start ${label}. Check that ${label} is installed and available on PATH and cwd still exists.`
-            : `Could not start ${label}: ${spawnError.message}`;
-          throw new Error(message, { cause: spawnError });
-        }
-        if (code !== 0) {
-          const status = exitSignal ? `was terminated by ${exitSignal}` : `exited with code ${code}`;
-          const details = [cleanOutput(output.stderr), cleanOutput(output.stdout)].filter(Boolean).join("\n");
-          throw new Error(`${label} ${status}.${details ? `\n${details}` : ""}`);
-        }
-        if (stdinError) {
-          throw new Error(`Could not send input to ${label}: ${stdinError.message}`, { cause: stdinError });
-        }
-        return { ...output, result: events?.finish(output.stdout) };
-      };
-      Promise.resolve(termination).then(complete).then(resolve, reject);
-    }
-
-    child.once("exit", (code, exitSignal) => {
-      running = false;
-      drainTimer = setTimeout(() => {
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.stderr.destroy();
-        finish(code, exitSignal);
-      }, pipeDrainMs);
-    });
-    child.once("close", (code, exitSignal) => {
-      running = false;
-      finish(code, exitSignal);
-    });
-    child.stdin.end(input);
-  });
-}
-
-async function runCodex(args, options) {
-  const [command, argv] = useProcessGroups ? ["codex", args] : await resolveWindowsCodex(args);
-  return runCommand(command, argv, { ...options, label: "Codex" });
+function effortArgs(effort) {
+  return effort === undefined ? [] : ["-c", `model_reasoning_effort=${effort}`];
 }
 
 function commandOutput({ stdout, stderr }) {
   return cleanOutput(stdout) || cleanOutput(stderr);
 }
 
-async function review({ cwd, target = "uncommitted", base, commit, prompt }, signal) {
+async function review({ cwd, target = "uncommitted", base, commit, prompt, effort }, signal) {
   if (target !== "base" && base !== undefined) {
     throw new Error("base can only be used when target is base.");
   }
@@ -397,7 +230,7 @@ async function review({ cwd, target = "uncommitted", base, commit, prompt }, sig
   if (target !== "uncommitted" && ref === undefined) {
     throw new Error(`${target} is required when target is ${target}.`);
   }
-  const args = ["exec", "-s", "read-only", "review"];
+  const args = ["exec", "-s", "read-only", ...effortArgs(effort), "review"];
   if (prompt !== undefined) {
     let header = target;
     if (ref !== undefined) {
@@ -420,8 +253,8 @@ async function review({ cwd, target = "uncommitted", base, commit, prompt }, sig
   return commandOutput(await runCodex(args, { cwd, signal }));
 }
 
-async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral }, signal) {
-  const args = ["exec", "--json", "-s", sandbox, "-C", cwd];
+async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral, effort }, signal) {
+  const args = ["exec", "--json", "-s", sandbox, "-C", cwd, ...effortArgs(effort)];
   if (model !== undefined) {
     args.push("-m", model);
   }
@@ -431,12 +264,12 @@ async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephem
   if (ephemeral) {
     args.push("--ephemeral");
   }
-  const { result } = await runCodex([...args, "-"], { input: prompt, signal, jsonl: true });
+  const { result } = await runCodex([...args, "-"], { input: prompt, signal, events: collectExecEvents() });
   return JSON.stringify(result);
 }
 
-async function resume({ cwd, prompt, sessionId, sandbox = "read-only" }, signal) {
-  const args = ["exec", "-s", sandbox, "resume", "--json"];
+async function resume({ cwd, prompt, sessionId, sandbox = "read-only", effort }, signal) {
+  const args = ["exec", "-s", sandbox, ...effortArgs(effort), "resume", "--json"];
   if (sessionId === undefined) {
     args.push("--last");
   } else {
@@ -446,7 +279,7 @@ async function resume({ cwd, prompt, sessionId, sandbox = "read-only" }, signal)
     }
     args.push(sessionId);
   }
-  const { result } = await runCodex([...args, "-"], { cwd, input: prompt, signal, jsonl: true });
+  const { result } = await runCodex([...args, "-"], { cwd, input: prompt, signal, events: collectExecEvents() });
   return JSON.stringify(result);
 }
 
@@ -470,12 +303,24 @@ function toolResult(text, isError = false) {
 }
 
 async function callTool(tool, args = {}, signal) {
+  let timer;
   try {
-    await validateArguments(args, tool.inputSchema);
+    validateArguments(args, tool.inputSchema);
     signal.throwIfAborted();
-    return toolResult(await tool.run(args, signal));
+    const timeoutMs = args.timeoutMs ?? tool.inputSchema.properties.timeoutMs.default;
+    const timeout = new AbortController();
+    const executionSignal = AbortSignal.any([signal, timeout.signal]);
+    timer = setTimeout(() => {
+      timeout.abort(new Error(`${tool.name} timed out after ${timeoutMs} ms.`));
+    }, timeoutMs).unref();
+    if (args.cwd !== undefined) {
+      await validateCwd(args.cwd, executionSignal);
+    }
+    return toolResult(await tool.run(args, executionSignal));
   } catch (error) {
     return toolResult(error.message, true);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -532,7 +377,7 @@ async function handleLine(line) {
             ? protocolVersion
             : supportedProtocolVersions[0],
           capabilities: { tools: {} },
-          serverInfo: { name: "codex-cli", version: "0.2.0" }
+          serverInfo: { name: "codex-cli", version: "0.2.1" }
         }
       });
       break;
@@ -581,7 +426,7 @@ async function shutdown(exitCode) {
   for (const controller of activeCalls.values()) {
     controller.abort();
   }
-  await Promise.allSettled([...activeChildren].map((terminate) => terminate()));
+  await terminateActiveCommands();
   process.exit(exitCode);
 }
 

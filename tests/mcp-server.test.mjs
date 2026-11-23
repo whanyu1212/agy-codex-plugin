@@ -9,10 +9,11 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { envWithPath, fakeCodexPath, writeFakeCodex } from "./fixtures/fake-codex.mjs";
 
 const SERVER = fileURLToPath(new URL("../scripts/mcp-server.mjs", import.meta.url));
-const FAKE_CODEX = String.raw`#!/usr/bin/env node
-const fs = require("node:fs");
+const isWindows = process.platform === "win32";
+const FAKE_CODEX = String.raw`const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const argv = process.argv.slice(2);
 const input = fs.readFileSync(0, "utf8");
@@ -31,15 +32,105 @@ if (holding) {
   });
   invocation.pid = process.pid;
 }
-if (mode === "lingering-pipe") {
-  const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20_000)"], {
-    stdio: ["ignore", 1, 2]
-  });
-  descendant.unref();
-  invocation.descendantPid = descendant.pid;
-}
 const recordInvocation = () => fs.appendFileSync(log, JSON.stringify(invocation) + "\n");
-if (mode === "group-hold" && holding) {
+const emit = (event) => console.log(JSON.stringify(event));
+
+function start() {
+  recordInvocation();
+  switch (argv.includes("review") ? "review" : argv[0]) {
+    case "review":
+      console.log("Review complete.");
+      break;
+    case "exec":
+      if (holding) {
+        setInterval(() => {}, 60_000);
+        break;
+      }
+      if (argv.includes("--worktree") && argv.includes("--ephemeral")) {
+        console.error("--worktree cannot be combined with --ephemeral");
+        process.exit(1);
+      }
+      if (mode === "fallback" || mode === "events-and-text") {
+        console.log("\x1b[32mPlain output.\x1b[0m");
+        if (mode === "fallback") break;
+      }
+      if (mode === "events-only" || mode === "events-and-text") {
+        emit({ type: "session.started", session_id: "session-456" });
+        emit({ type: "turn.completed" });
+        break;
+      }
+      if (mode === "large-output") {
+        process.stderr.write("stderr: " + "e".repeat(2 ** 21) + "\nstderr tail");
+        process.stdout.write("stdout: " + "o".repeat(2 ** 21) + "\nstdout tail");
+        process.exitCode = 3;
+        break;
+      }
+      if (mode === "large-plain") {
+        console.log('{ "notice": "' + "x".repeat(2 ** 21) + '" }');
+        break;
+      }
+      if (mode === "large-event") {
+        emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "x".repeat(2 ** 21) } });
+      }
+      emit({ type: "thread.started", thread_id: "thread-123" });
+      emit({ type: "item.completed", item: { type: "agent_message", text: "Working on it." } });
+      console.log("CLI notice.");
+      emit({ type: "item.completed", item: { type: "agent_message", text: "Done.\nAll set." } });
+      if (mode === "large-final") {
+        emit({ type: "item.completed", item: { id: "item_3", type: "agent_message", text: "x".repeat(2 ** 21) } });
+      }
+      if (mode === "large-mcp-call") {
+        emit({ type: "item.completed", item: {
+          id: "item_3", type: "mcp_tool_call", arguments: { type: "agent_message", text: "x".repeat(2 ** 21) }
+        } });
+      }
+      emit({ type: "item.completed", item: { type: "reasoning", text: "Private reasoning." } });
+      emit({ type: "turn.completed" });
+      break;
+    case "--version":
+      console.log("codex-cli 0.test");
+      break;
+    case "doctor":
+      if (argv[1] === "--summary") {
+        if (mode === "legacy") {
+          console.error("error: unexpected argument '--summary' found");
+          process.exit(2);
+        }
+        if (mode === "unhealthy") {
+          console.error("Codex startup warning.");
+          console.log("Doctor login check failed.");
+          process.exit(3);
+        }
+        console.log("Summary checks passed.");
+      } else {
+        console.log("Detailed checks passed.");
+      }
+      break;
+    default:
+      console.error("Unexpected Codex arguments.");
+      process.exit(4);
+  }
+}
+
+if (mode === "lingering-pipe") {
+  const descendant = spawn(
+    process.execPath,
+    ["-e", 'setInterval(() => {}, 60_000); process.send("ready");'],
+    { stdio: ["ignore", "inherit", "inherit", "ipc"], detached: true, windowsHide: true }
+  );
+  invocation.descendantPid = descendant.pid;
+  const onEarlyExit = (code, signal) => {
+    console.error("lingering-pipe descendant exited before ready:", { code, signal });
+    process.exit(1);
+  };
+  descendant.once("exit", onEarlyExit);
+  descendant.once("message", () => {
+    descendant.removeListener("exit", onEarlyExit);
+    descendant.disconnect();
+    descendant.unref();
+    start();
+  });
+} else if (mode === "group-hold" && holding) {
   const code = [
     'const fs = require("node:fs");',
     'process.on("SIGTERM", () => fs.appendFileSync(process.argv[1], JSON.stringify("descendant trapped") + "\\n"));',
@@ -50,91 +141,16 @@ if (mode === "group-hold" && holding) {
   invocation.descendantPid = descendant.pid;
   descendant.once("message", () => {
     descendant.disconnect();
-    recordInvocation();
+    start();
   });
 } else {
-  recordInvocation();
-}
-const emit = (event) => console.log(JSON.stringify(event));
-
-switch (argv.includes("review") ? "review" : argv[0]) {
-  case "review":
-    console.log("Review complete.");
-    break;
-  case "exec":
-    if (holding) {
-      setInterval(() => {}, 60_000);
-      break;
-    }
-    if (argv.includes("--worktree") && argv.includes("--ephemeral")) {
-      console.error("--worktree cannot be combined with --ephemeral");
-      process.exit(1);
-    }
-    if (mode === "fallback" || mode === "events-and-text") {
-      console.log("\x1b[32mPlain output.\x1b[0m");
-      if (mode === "fallback") break;
-    }
-    if (mode === "events-only" || mode === "events-and-text") {
-      emit({ type: "session.started", session_id: "session-456" });
-      emit({ type: "turn.completed" });
-      break;
-    }
-    if (mode === "large-output") {
-      process.stderr.write("stderr: " + "e".repeat(2 ** 21) + "\nstderr tail");
-      process.stdout.write("stdout: " + "o".repeat(2 ** 21) + "\nstdout tail");
-      process.exitCode = 3;
-      break;
-    }
-    if (mode === "large-plain") {
-      console.log('{ "notice": "' + "x".repeat(2 ** 21) + '" }');
-      break;
-    }
-    if (mode === "large-event") {
-      emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "x".repeat(2 ** 21) } });
-    }
-    emit({ type: "thread.started", thread_id: "thread-123" });
-    emit({ type: "item.completed", item: { type: "agent_message", text: "Working on it." } });
-    console.log("CLI notice.");
-    emit({ type: "item.completed", item: { type: "agent_message", text: "Done.\nAll set." } });
-    if (mode === "large-final") {
-      emit({ type: "item.completed", item: { id: "item_3", type: "agent_message", text: "x".repeat(2 ** 21) } });
-    }
-    if (mode === "large-mcp-call") {
-      emit({ type: "item.completed", item: {
-        id: "item_3", type: "mcp_tool_call", arguments: { type: "agent_message", text: "x".repeat(2 ** 21) }
-      } });
-    }
-    emit({ type: "item.completed", item: { type: "reasoning", text: "Private reasoning." } });
-    emit({ type: "turn.completed" });
-    break;
-  case "--version":
-    console.log("codex-cli 0.test");
-    break;
-  case "doctor":
-    if (argv[1] === "--summary") {
-      if (mode === "legacy") {
-        console.error("error: unexpected argument '--summary' found");
-        process.exit(2);
-      }
-      if (mode === "unhealthy") {
-        console.error("Codex startup warning.");
-        console.log("Doctor login check failed.");
-        process.exit(3);
-      }
-      console.log("Summary checks passed.");
-    } else {
-      console.log("Detailed checks passed.");
-    }
-    break;
-  default:
-    console.error("Unexpected Codex arguments.");
-    process.exit(4);
+  start();
 }
 `;
 
 function fixture(t, { mode = "", withCodex = true } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-"));
-  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const root = fs.realpathSync(temp);
   const cwd = path.join(root, "project with spaces");
   const bin = path.join(root, "bin");
@@ -142,9 +158,11 @@ function fixture(t, { mode = "", withCodex = true } = {}) {
   fs.mkdirSync(cwd);
   fs.mkdirSync(bin);
   fs.writeFileSync(log, "");
-  fs.symlinkSync(process.execPath, path.join(bin, "node"));
+  if (!isWindows) {
+    fs.symlinkSync(process.execPath, path.join(bin, "node"));
+  }
   if (withCodex) {
-    fs.writeFileSync(path.join(bin, "codex"), FAKE_CODEX, { mode: 0o755 });
+    writeFakeCodex(bin, FAKE_CODEX);
   }
   return { cwd, root, bin, log, mode };
 }
@@ -156,8 +174,7 @@ function rpc(id, method, params) {
 function serverOptions({ root, bin, log, mode, withGit }) {
   return {
     cwd: root,
-    env: { ...process.env, PATH: withGit ? [bin, process.env.PATH].join(path.delimiter) : bin,
-      FAKE_CODEX_LOG: log, FAKE_CODEX_MODE: mode }
+    env: envWithPath(fakeCodexPath(bin, withGit), { FAKE_CODEX_LOG: log, FAKE_CODEX_MODE: mode })
   };
 }
 
@@ -262,7 +279,7 @@ test("initializes and lists typed tools", async (t) => {
   const initialize = {
     protocolVersion: "2025-06-18",
     capabilities: { tools: {} },
-    serverInfo: { name: "codex-cli", version: "0.2.0" }
+    serverInfo: { name: "codex-cli", version: "0.2.1" }
   };
   assert.deepEqual(invocations, []);
   assert.deepEqual(replies.map(({ jsonrpc, id }) => [jsonrpc, id]), [
@@ -276,12 +293,18 @@ test("initializes and lists typed tools", async (t) => {
   assert.deepEqual(replies[6].result, replies[3].result);
 
   const expected = {
-    codex_review: [["cwd"], { cwd: "string", target: "string", base: "string", commit: "string", prompt: "string" }],
-    codex_exec: [["cwd", "prompt"], {
-      cwd: "string", prompt: "string", sandbox: "string", model: "string", worktree: "boolean", ephemeral: "boolean"
+    codex_review: [["cwd"], {
+      cwd: "string", target: "string", base: "string", commit: "string", prompt: "string",
+      effort: "string", timeoutMs: "integer"
     }],
-    codex_resume: [["cwd", "prompt"], { cwd: "string", prompt: "string", sessionId: "string", sandbox: "string" }],
-    codex_doctor: [[], { cwd: "string" }]
+    codex_exec: [["cwd", "prompt"], {
+      cwd: "string", prompt: "string", sandbox: "string", model: "string", worktree: "boolean", ephemeral: "boolean",
+      effort: "string", timeoutMs: "integer"
+    }],
+    codex_resume: [["cwd", "prompt"], {
+      cwd: "string", prompt: "string", sessionId: "string", sandbox: "string", effort: "string", timeoutMs: "integer"
+    }],
+    codex_doctor: [[], { cwd: "string", timeoutMs: "integer" }]
   };
   const { tools } = replies[2].result;
   assert.deepEqual(tools.map(({ name }) => name).sort(), Object.keys(expected).sort());
@@ -302,6 +325,14 @@ test("initializes and lists typed tools", async (t) => {
   for (const name of ["codex_exec", "codex_resume"]) {
     assert.deepEqual(inputs[name].properties.sandbox.enum, ["read-only", "workspace-write"]);
     assert.equal(inputs[name].properties.sandbox.default, "read-only");
+  }
+  for (const [name, { properties }] of Object.entries(inputs)) {
+    assert.equal(properties.timeoutMs.minimum, 1_000);
+    assert.equal(properties.timeoutMs.maximum, 1_800_000);
+    assert.equal(properties.timeoutMs.default, name === "codex_doctor" ? 60_000 : 600_000);
+    if (name !== "codex_doctor") {
+      assert.deepEqual(properties.effort.enum, ["low", "medium", "high"]);
+    }
   }
 });
 
@@ -344,6 +375,23 @@ for (const [target, ref] of [["base", "missing-branch"], ["commit", "--help"], [
 }
 
 const execResult = { sessionId: "thread-123", finalMessage: "Done.\nAll set." };
+for (const [name, effort, subcommand, timeoutMs] of [
+  ["codex_review", "low", "review", 1_800_000],
+  ["codex_exec", "medium", "-", 1_000],
+  ["codex_resume", "high", "resume", 60_000]
+]) {
+  test(`sets effort for ${name}`, async (t) => {
+    const f = fixture(t);
+    const { isError, invocations } = await invoke(f, name, { cwd: f.cwd, prompt: "Check this.", effort, timeoutMs });
+    assert.equal(isError, false);
+    assert.equal(invocations.length, 1);
+    const { argv } = invocations[0];
+    const configIndex = argv.indexOf("-c");
+    assert.ok(configIndex > 0 && configIndex + 1 < argv.indexOf(subcommand));
+    assert.equal(argv[configIndex + 1], `model_reasoning_effort=${effort}`);
+  });
+}
+
 for (const [label, options, flags] of [
   ["with default sandbox", {}, ["-s", "read-only"]],
   ["with worktree and model", { sandbox: "workspace-write", model: "test-model", worktree: true },
@@ -428,7 +476,13 @@ test("rejects invalid tool arguments", async (t) => {
     ["codex_resume", { cwd: f.cwd }, /prompt is required/],
     ["codex_resume", { cwd: f.cwd, prompt: "" }, /prompt must not be empty/],
     ["codex_resume", { cwd: f.cwd, prompt: "Hello", sandbox: "danger-full-access" }, /sandbox must be one of/],
-    ["codex_doctor", null, /arguments must be an object/]
+    ["codex_doctor", null, /arguments must be an object/],
+    ["codex_review", { cwd: f.cwd, effort: "extra-high" }, /effort must be one of: low, medium, high/],
+    ["codex_exec", { cwd: f.cwd, prompt: "Hello", effort: 1 }, /effort must be a string/],
+    ["codex_review", { cwd: f.cwd, timeoutMs: "1000" }, /timeoutMs must be an integer/],
+    ["codex_exec", { cwd: f.cwd, prompt: "Hello", timeoutMs: 1_000.5 }, /timeoutMs must be an integer/],
+    ["codex_resume", { cwd: f.cwd, prompt: "Hello", timeoutMs: 999 }, /timeoutMs must be at least 1000/],
+    ["codex_doctor", { timeoutMs: 1_800_001 }, /timeoutMs must be at most 1800000/]
   ];
   const { replies, invocations } = await runServer(f, ...requests.map(([name, args], index) => (
     rpc(index, "tools/call", { name, arguments: args })
@@ -497,7 +551,11 @@ test("bounds inherited pipe draining", async (t) => {
     assert.doesNotThrow(() => process.kill(invocations[0].descendantPid, 0));
   } finally {
     const line = fs.readFileSync(f.log, "utf8").trim();
-    if (line) forceKill(JSON.parse(line).descendantPid);
+    if (line) {
+      const pid = JSON.parse(line).descendantPid;
+      forceKill(pid);
+      await waitForProcessDeath(pid, AbortSignal.timeout(5_000));
+    }
   }
 });
 
@@ -521,7 +579,7 @@ function waitForStatus(f, signal, status) {
   return waitForLog(f, signal, (log) => log.includes(`${JSON.stringify(status)}\n`));
 }
 
-function runHeldCall(f) {
+function runHeldCall(f, options = {}) {
   const signal = AbortSignal.timeout(5_000);
   const server = spawn(process.execPath, [SERVER], serverOptions(f));
   const exited = once(server, "close", { signal });
@@ -533,7 +591,7 @@ function runHeldCall(f) {
     const [line] = log.split("\n");
     return line && log.includes("\n") && JSON.parse(line);
   });
-  send(rpc(1, "tools/call", { name: "codex_exec", arguments: { cwd: f.cwd, prompt: "Hold." } }));
+  send(rpc(1, "tools/call", { name: "codex_exec", arguments: { cwd: f.cwd, prompt: "Hold.", ...options } }));
   return { server, signal, exited, output, replies, send, started };
 }
 
@@ -543,9 +601,10 @@ test("cancels a running request", async (t) => {
   let pid;
   try {
     ({ pid } = await started);
-    const stopped = waitForStatus(f, signal, "stopped");
+    const stopped = isWindows ? undefined : waitForStatus(f, signal, "stopped");
     send(rpc(undefined, "notifications/cancelled", { requestId: 1 }));
     await stopped;
+    await waitForProcessDeath(pid, signal);
 
     const next = once(output, "line", { signal });
     send(rpc(2, "tools/call", { name: "codex_doctor" }));
@@ -554,7 +613,6 @@ test("cancels a running request", async (t) => {
     assert.deepEqual(await exited, [0, null]);
     assert.deepEqual(replies.map(({ id }) => id), [2]);
     assert.equal(replies[0].result.isError, false);
-    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   } finally {
     server.kill("SIGKILL");
     forceKill(pid);
@@ -584,11 +642,11 @@ test("cancels a lingering descendant", async (t) => {
   let invocation;
   try {
     invocation = await started;
-    const trapped = waitForStatus(f, signal, "descendant trapped");
+    const trapped = isWindows ? undefined : waitForStatus(f, signal, "descendant trapped");
     send(rpc(undefined, "notifications/cancelled", { requestId: 1 }));
     await trapped;
     await waitForProcessDeath(invocation.descendantPid, signal);
-    assert.throws(() => process.kill(invocation.pid, 0), { code: "ESRCH" });
+    await waitForProcessDeath(invocation.pid, signal);
 
     const pong = once(output, "line", { signal });
     send(rpc(2, "ping"));
@@ -603,7 +661,7 @@ test("cancels a lingering descendant", async (t) => {
   }
 });
 
-test("escalates shutdown for SIGTERM traps", async (t) => {
+test("escalates shutdown for SIGTERM traps", { skip: isWindows && "POSIX signal handlers only" }, async (t) => {
   const f = fixture(t, { mode: "trap-term" });
   const { server, exited, started } = runHeldCall(f);
   let pid;
@@ -619,20 +677,21 @@ test("escalates shutdown for SIGTERM traps", async (t) => {
   }
 });
 
-for (const [label, trigger, expectedStatus] of [
-  ["on SIGTERM", (server) => server.kill("SIGTERM"), 143],
-  ["when stdin closes", (server) => server.stdin.end(), 0]
+for (const [label, trigger, expectedStatus, skipReason] of [
+  ["on SIGTERM", (server) => server.kill("SIGTERM"), 143, isWindows && "POSIX signal handlers only"],
+  ["when stdin closes", (server) => server.stdin.end(), 0, false]
 ]) {
-  test(`terminates active Codex child ${label}`, async (t) => {
+  test(`terminates active Codex child ${label}`, { skip: skipReason }, async (t) => {
     const f = fixture(t, { mode: "hold" });
     const { server, signal, exited, started } = runHeldCall(f);
     let pid;
     try {
       ({ pid } = await started);
-      const stopped = waitForStatus(f, signal, "stopped");
+      const stopped = isWindows ? undefined : waitForStatus(f, signal, "stopped");
       trigger(server);
       const [exitStatus] = await Promise.all([exited, stopped]);
       assert.deepEqual(exitStatus, [expectedStatus, null]);
+      await waitForProcessDeath(pid, signal);
     } finally {
       server.kill("SIGKILL");
       forceKill(pid);
@@ -650,6 +709,28 @@ test("surfaces incompatible exec flags", async (t) => {
   assert.deepEqual(invocations[0].argv.slice(-3), ["--worktree", "--ephemeral", "-"]);
 });
 
+test("times out and terminates Codex", async (t) => {
+  const f = fixture(t, { mode: "hold" });
+  const timeoutMs = 1_500;
+  const { server, signal, exited, output, replies, started } = runHeldCall(f, { timeoutMs });
+  let pid;
+  try {
+    const reply = once(output, "line", { signal }).then(() => {
+      assert.deepEqual(replies, [{
+        jsonrpc: "2.0", id: 1,
+        result: { isError: true, content: [{ type: "text", text: `codex_exec timed out after ${timeoutMs} ms.` }] }
+      }]);
+    });
+    await Promise.all([started.then((invocation) => { pid = invocation.pid; }), reply]);
+    await waitForProcessDeath(pid, signal);
+    server.stdin.end();
+    assert.deepEqual(await exited, [0, null]);
+  } finally {
+    server.kill("SIGKILL");
+    forceKill(pid);
+  }
+});
+
 test("answers ping while Codex child is running", async (t) => {
   const f = fixture(t, { mode: "hold" });
   const { server, signal, exited, output, replies, send, started } = runHeldCall(f);
@@ -660,10 +741,11 @@ test("answers ping while Codex child is running", async (t) => {
     send(rpc(2, "ping"));
     await pong;
     assert.deepEqual(replies, [{ jsonrpc: "2.0", id: 2, result: {} }]);
-    const stopped = waitForStatus(f, signal, "stopped");
-    server.kill("SIGTERM");
+    const stopped = isWindows ? undefined : waitForStatus(f, signal, "stopped");
+    server.stdin.end();
     const [exitStatus] = await Promise.all([exited, stopped]);
-    assert.deepEqual(exitStatus, [143, null]);
+    assert.deepEqual(exitStatus, [0, null]);
+    await waitForProcessDeath(pid, signal);
   } finally {
     server.kill("SIGKILL");
     forceKill(pid);

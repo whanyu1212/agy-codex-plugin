@@ -23,6 +23,8 @@ Antigravity's native `run_command` background execution and reactive wakeup.
 - Add `--worktree` only when the user explicitly asks for an isolated Git
   worktree.
 - Add `-m <model>` only when the user explicitly specifies a model.
+- For a faster run on a bounded task, optionally add
+  `-c model_reasoning_effort=medium` after `codex exec` and before any subcommand.
 - If `codex` is missing or unauthenticated, direct the user to `/codex-setup`.
 
 ## Steps
