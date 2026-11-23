@@ -9,8 +9,9 @@ description: >-
 
 # Codex Review
 
-Run a non-interactive code review using the local `codex exec -s read-only review`
-command.
+Run a non-interactive, read-only code review with the bundled Codex runner.
+Resolve `<plugin-root>` two levels up from the directory containing this
+`SKILL.md`. Run commands from the repository under review.
 
 ## Core Rules
 
@@ -24,23 +25,23 @@ command.
 ## Steps
 
 1. **Determine the review target** from the user's request:
-   - **Default (uncommitted changes)**: `codex exec -s read-only review --uncommitted`
+   - **Default (uncommitted changes)**: `--uncommitted`
    - **Branch diff** (e.g. `--base main` or "against main"):
-     `codex exec -s read-only review --base <branch>`
+     `--base <branch>`
    - **Single commit** (e.g. `--commit <sha>`):
-     `codex exec -s read-only review --commit <sha>`
+     `--commit <sha>`
 
 2. **Check git state first** so you do not run an empty review and can choose
    foreground vs. background execution:
    - For uncommitted changes:
      `git status --short --untracked-files=all && git diff --shortstat --cached && git diff --shortstat`
-   - For base branch diff:
-     `git diff --shortstat <branch>...HEAD`
-   - For a commit:
-     `git show --stat --oneline <sha>`
+   - For a branch or commit, pass the supplied ref as a shell-quoted argument.
+     With the ref in `$ref`, run `git rev-parse --verify --end-of-options "${ref}^{commit}"`
+     before using the resulting SHA with `git diff --shortstat <sha>...HEAD` or
+     `git show --stat --oneline <sha>`.
    - If there are no changes to review, report that clearly and stop.
 
-3. **Run `codex exec -s read-only review` via `run_command`**:
+3. **Run the bundled review command via `run_command`**:
    - **Small diff** (roughly 1–2 files changed): run in the foreground with
      `WaitMsBeforeAsync: 10000`.
    - **Larger or unclear diff**: launch with `WaitMsBeforeAsync: 500` so the
@@ -50,9 +51,12 @@ command.
 
    Examples:
    ```bash
-   codex exec -s read-only review --uncommitted
-   codex exec -s read-only review --base main
-   codex exec -s read-only review --commit abc1234
+   node "<plugin-root>/scripts/codex-run.mjs" review --uncommitted
+   node "<plugin-root>/scripts/codex-run.mjs" review --base main
+   node "<plugin-root>/scripts/codex-run.mjs" review --commit abc1234
    ```
+
+   If the runner script is unavailable, use `codex exec -s read-only review`
+   with the same target flag and the validated ref where applicable.
 
 4. **Return the review output** cleanly to the user without modifying any files.

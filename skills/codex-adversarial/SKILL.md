@@ -9,8 +9,10 @@ description: >-
 
 # Codex Adversarial Review
 
-Run a skeptical, steerable challenge review using `codex exec -s read-only review` with custom
-instructions passed via stdin (`-`).
+Run a skeptical, read-only challenge review with the bundled Codex runner and
+pass custom instructions on stdin. Resolve `<plugin-root>` two levels up from
+the directory containing this `SKILL.md`. Run commands from the repository
+under review.
 
 ## Core Rules
 
@@ -23,31 +25,27 @@ instructions passed via stdin (`-`).
 
 ## Steps
 
-1. **Determine the target scope** (the review command does not allow `--uncommitted`,
-   `--base`, or `--commit` flags together with a custom prompt, so specify the
-   target scope inside the prompt's `Target:` line):
-   - **Default (uncommitted changes)**:
-     `Target: review the uncommitted changes in this repository (inspect git status and git diff HEAD).`
-   - **Base branch** (e.g. `--base main`):
-     `Target: review the branch diff against <branch> (inspect git diff <branch>...HEAD).`
-   - **Commit** (e.g. `--commit <sha>`):
-     `Target: review commit <sha> (inspect git show <sha>).`
+1. **Choose the target flag**. Use `--uncommitted` by default, `--base <ref>`
+   for a branch diff, or `--commit <ref>` for a single commit. The runner
+   adds the target to the stdin prompt and resolves Git refs to commit SHAs.
 
 2. **Verify there are changes to review**:
    - Uncommitted: `git status --short --untracked-files=all && git diff --shortstat --cached && git diff --shortstat`
-   - Branch: `git diff --shortstat <branch>...HEAD`
-   - Commit: `git show --stat --oneline <sha>`
+   - For a branch or commit, pass the supplied ref as a shell-quoted argument.
+     With the ref in `$ref`, run `git rev-parse --verify --end-of-options "${ref}^{commit}"`
+     before using the resulting SHA with `git diff --shortstat <sha>...HEAD` or
+     `git show --stat --oneline <sha>`.
    - If nothing changed, inform the user and stop.
 
-3. **Run `codex exec -s read-only review -` with the adversarial rubric via stdin** (`WaitMsBeforeAsync: 500`
-   for medium/large diffs so Antigravity wakes you up when done, or `10000` for
-   tiny 1–2 file diffs). Replace the `Target:` line when reviewing a branch or
-   commit, and append any user-specified focus area under `Additional focus`:
+3. **Run the bundled review command via `run_command`** with the adversarial
+   rubric on stdin. Use `WaitMsBeforeAsync: 500` for medium or large diffs so
+   Antigravity wakes you up when done, or `10000` for a 1–2 file diff. If the
+   command backgrounds, tell the user and stop calling tools until Antigravity
+   notifies you. Replace the target flag as needed and append any user-specified
+   focus area under `Additional focus`.
 
    ```bash
-   codex exec -s read-only review - <<'EOF'
-   Target: review the uncommitted changes in this repository (inspect git status and git diff HEAD).
-
+   node "<plugin-root>/scripts/codex-run.mjs" review --uncommitted --prompt-stdin <<'EOF'
    Perform a skeptical, adversarial code review of these changes. Assume bugs are hiding until proven otherwise.
 
    Focus on:
@@ -60,5 +58,8 @@ instructions passed via stdin (`-`).
    Ignore style nits. Report only concrete, evidence-backed findings with file paths, line numbers, failure scenarios, and suggested fixes.
    EOF
    ```
+
+   If the runner script is unavailable, use `codex exec -s read-only review -`
+   with the same rubric and put the scope in a `Target:` line in the prompt.
 
 4. **Present the findings** directly to the user without altering any files.

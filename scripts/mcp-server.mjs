@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 
-import { promises as fs, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import process from "node:process";
 import { createInterface } from "node:readline";
+import { terminateActiveCommands } from "./codex-command.mjs";
 import {
-  cleanOutput, collectExecEvents, runCodex, runGit, terminateActiveCommands, withAbort
-} from "./codex-command.mjs";
+  defaultSandbox, defaultTimeoutMs, doctorTimeoutMs, efforts, maxTimeoutMs, minTimeoutMs,
+  runDoctor, runExec, runOperation, runResume, runReview, sandboxes
+} from "./codex-ops.mjs";
 
 const cwdProperty = { type: "string", minLength: 1, description: "Working directory for Codex." };
 const promptProperty = { type: "string", minLength: 1, description: "Prompt to send to Codex on stdin." };
-const sandboxProperty = { type: "string", enum: ["read-only", "workspace-write"], default: "read-only" };
+const sandboxProperty = { type: "string", enum: sandboxes, default: defaultSandbox };
 const effortProperty = {
-  type: "string", enum: ["low", "medium", "high"], description: "Override Codex model reasoning effort."
+  type: "string", enum: efforts, description: "Override Codex model reasoning effort."
 };
 const timeoutProperty = {
-  type: "integer", minimum: 1_000, maximum: 1_800_000, default: 600_000,
+  type: "integer", minimum: minTimeoutMs, maximum: maxTimeoutMs, default: defaultTimeoutMs,
   description: "Time limit in milliseconds for the tool's commands."
 };
 const supportedProtocolVersions = ["2025-06-18", "2024-11-05"];
@@ -49,7 +51,7 @@ const tools = [
       ],
       additionalProperties: false
     },
-    run: review
+    run: runReview
   },
   {
     name: "codex_exec",
@@ -69,7 +71,7 @@ const tools = [
       required: ["cwd", "prompt"],
       additionalProperties: false
     },
-    run: exec
+    run: runExec
   },
   {
     name: "codex_resume",
@@ -88,17 +90,17 @@ const tools = [
       required: ["cwd", "prompt"],
       additionalProperties: false
     },
-    run: resume
+    run: runResume
   },
   {
     name: "codex_doctor",
     description: "Show the installed Codex version and local diagnostic results.",
     inputSchema: {
       type: "object",
-      properties: { cwd: cwdProperty, timeoutMs: { ...timeoutProperty, default: 60_000 } },
+      properties: { cwd: cwdProperty, timeoutMs: { ...timeoutProperty, default: doctorTimeoutMs } },
       additionalProperties: false
     },
-    run: doctor
+    run: runDoctor
   }
 ];
 
@@ -140,143 +142,48 @@ function validateArguments(args, schema) {
   }
 }
 
-async function validateCwd(cwd, signal) {
-  let canonicalCwd;
-  let info;
-  try {
-    canonicalCwd = await withAbort(signal, () => fs.realpath(cwd));
-    info = await withAbort(signal, () => fs.stat(canonicalCwd));
-  } catch (error) {
-    signal.throwIfAborted();
-    throw new Error(`Cannot access cwd ${JSON.stringify(cwd)}: ${error.message}`, { cause: error });
-  }
-  if (!info.isDirectory()) {
-    throw new Error(`cwd must be a directory: ${JSON.stringify(cwd)}.`);
-  }
-  return canonicalCwd;
-}
-
-function effortArgs(effort) {
-  return effort === undefined ? [] : ["-c", `model_reasoning_effort=${effort}`];
-}
-
-function commandOutput({ stdout, stderr }) {
-  return cleanOutput(stdout) || cleanOutput(stderr);
-}
-
-async function review({ cwd, target = "uncommitted", base, commit, prompt, effort }, signal) {
-  if (target !== "base" && base !== undefined) {
-    throw new Error("base can only be used when target is base.");
-  }
-  if (target !== "commit" && commit !== undefined) {
-    throw new Error("commit can only be used when target is commit.");
-  }
-  const ref = { base, commit }[target];
-  if (target !== "uncommitted" && ref === undefined) {
-    throw new Error(`${target} is required when target is ${target}.`);
-  }
-  let sha;
-  if (ref !== undefined) {
-    try {
-      const { stdout } = await runGit(["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], { cwd, signal });
-      sha = stdout.trim();
-    } catch (error) {
-      signal.throwIfAborted();
-      throw new Error(`Cannot resolve Git ref ${JSON.stringify(ref)} to a commit. ${error.message}`, { cause: error });
-    }
-  }
-  const args = ["exec", "-s", "read-only", ...effortArgs(effort), "review"];
-  if (prompt !== undefined) {
-    const header = sha === undefined ? target : `${target} ${sha}`;
-    return commandOutput(await runCodex([...args, "-"], { cwd, input: `Target: ${header}\n\n${prompt}`, signal }));
-  }
-  args.push(`--${target}`);
-  if (ref !== undefined) {
-    args.push(target === "commit" || ref.startsWith("-") ? sha : ref);
-  }
-  return commandOutput(await runCodex(args, { cwd, signal }));
-}
-
-async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral, effort }, signal) {
-  if (worktree && ephemeral) {
-    throw new Error("worktree and ephemeral cannot be combined.");
-  }
-  if (worktree && sandbox !== "workspace-write") {
-    throw new Error('worktree requires sandbox "workspace-write".');
-  }
-  if (model !== undefined && model.startsWith("-")) {
-    throw new Error("model must not start with '-'.");
-  }
-  const args = ["exec", "--json", "-s", sandbox, "-C", cwd, ...effortArgs(effort)];
-  if (model !== undefined) {
-    args.push("-m", model);
-  }
-  if (worktree) {
-    args.push("--worktree");
-  }
-  if (ephemeral) {
-    args.push("--ephemeral");
-  }
-  const { result } = await runCodex([...args, "-"], {
-    input: prompt, signal, events: collectExecEvents({ fallbackToStdout: true })
-  });
-  return JSON.stringify(result);
-}
-
-async function resume({ cwd, prompt, sessionId, sandbox = "read-only", effort }, signal) {
-  const args = ["exec", "-s", sandbox, ...effortArgs(effort), "resume", "--json"];
-  if (sessionId === undefined) {
-    args.push("--last");
-  } else {
-    // A thread name can begin with a dash. Keep it in the positional arguments.
-    if (sessionId.startsWith("-")) {
-      args.push("--");
-    }
-    args.push(sessionId);
-  }
-  const { result } = await runCodex([...args, "-"], {
-    cwd, input: prompt, signal, events: collectExecEvents({ fallbackToStdout: true })
-  });
-  return JSON.stringify(result);
-}
-
-async function doctor({ cwd }, signal) {
-  const version = await runCodex(["--version"], { cwd, signal });
-  let report;
-  try {
-    report = await runCodex(["doctor", "--summary"], { cwd, signal });
-  } catch (error) {
-    const unsupportedSummary = /\b(?:unexpected|unknown|unrecognized|unsupported)\s+(?:argument|option|flag)s?[\s:'"`]*--summary\b/i;
-    if (!unsupportedSummary.test(error.message)) {
-      throw error;
-    }
-    report = await runCodex(["doctor"], { cwd, signal });
-  }
-  return [commandOutput(version), commandOutput(report)].filter(Boolean).join("\n\n");
-}
-
 function toolResult(text, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
 
-async function callTool(tool, args = {}, signal) {
-  let timer;
+async function callTool(tool, args = {}, signal, onEvent) {
   try {
     validateArguments(args, tool.inputSchema);
-    signal.throwIfAborted();
     const timeoutMs = args.timeoutMs ?? tool.inputSchema.properties.timeoutMs.default;
-    const timeout = new AbortController();
-    const executionSignal = AbortSignal.any([signal, timeout.signal]);
-    timer = setTimeout(() => {
-      timeout.abort(new Error(`${tool.name} timed out after ${timeoutMs} ms.`));
-    }, timeoutMs).unref();
-    const toolArgs = args.cwd === undefined ? args : { ...args, cwd: await validateCwd(args.cwd, executionSignal) };
-    return toolResult(await tool.run(toolArgs, executionSignal));
+    return toolResult(await runOperation(tool.run, args, { name: tool.name, signal, onEvent, timeoutMs }));
   } catch (error) {
     return toolResult(error.message, true);
-  } finally {
-    clearTimeout(timer);
   }
+}
+
+function notify(method, params) {
+  if (!shuttingDown) {
+    process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  }
+}
+
+function progressReporter(id, controller, progressToken) {
+  let progress = 0;
+  let lastItem = -Infinity;
+  return (event) => {
+    if (controller.signal.aborted || activeCalls.get(id) !== controller) {
+      return;
+    }
+    let message;
+    if (event.kind === "session") {
+      message = `Codex session started: ${event.sessionId}`;
+    } else if (event.kind === "item") {
+      const now = performance.now();
+      if (now - lastItem < 1_000) {
+        return;
+      }
+      lastItem = now;
+      message = `Codex completed step (${event.itemType})`;
+    } else {
+      return;
+    }
+    notify("notifications/progress", { progressToken, progress: ++progress, message });
+  };
 }
 
 function respond(id, payload) {
@@ -356,8 +263,12 @@ async function handleLine(line) {
       }
       const controller = new AbortController();
       activeCalls.set(id, controller);
+      const progressToken = params?._meta?.progressToken;
+      const onEvent = typeof progressToken === "string" || Number.isSafeInteger(progressToken)
+        ? progressReporter(id, controller, progressToken)
+        : undefined;
       try {
-        const result = await callTool(tool, params.arguments, controller.signal);
+        const result = await callTool(tool, params.arguments, controller.signal, onEvent);
         if (!controller.signal.aborted) {
           respond(id, { result });
         }

@@ -20,12 +20,17 @@ const input = fs.readFileSync(0, "utf8");
 const log = process.env.FAKE_CODEX_LOG;
 const mode = process.env.FAKE_CODEX_MODE;
 const invocation = { argv, cwd: process.cwd(), input };
-const holding = ["hold", "group-hold", "trap-term"].includes(mode) && argv[0] === "exec" && !argv.includes("review");
+const holding = ["hold", "group-hold", "trap-term", "cancel-progress"].includes(mode)
+  && argv[0] === "exec" && !argv.includes("review");
 if (holding) {
   process.on("SIGTERM", () => {
     if (mode === "trap-term") {
       fs.appendFileSync(log, '"trapped"\n');
       return;
+    }
+    if (mode === "cancel-progress") {
+      fs.writeSync(1, JSON.stringify({ type: "session.started", session_id: "late-session" }) + "\n");
+      fs.writeSync(1, JSON.stringify({ type: "agent_message", text: "Late item." }) + "\n");
     }
     fs.appendFileSync(log, '"stopped"\n');
     process.exit(0);
@@ -43,7 +48,15 @@ function start() {
       break;
     case "exec":
       if (holding) {
+        if (mode === "cancel-progress") emit({ type: "thread.started", thread_id: "thread-123" });
         setInterval(() => {}, 60_000);
+        break;
+      }
+      if (mode === "spaced-progress") {
+        emit({ type: "session.started", session_id: "session-456" });
+        emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "Private command output." } });
+        emit({ type: "item.completed", item: { type: "reasoning", text: "Private reasoning." } });
+        setTimeout(() => process.stdout.write(JSON.stringify({ type: "agent_message", text: "Done." })), 1_250);
         break;
       }
       if (argv.includes("--worktree") && argv.includes("--ephemeral")) {
@@ -73,6 +86,9 @@ function start() {
         emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "x".repeat(2 ** 21) } });
       }
       emit({ type: "thread.started", thread_id: "thread-123" });
+      if (mode === "malformed-item-type") {
+        emit({ type: "item.completed", item: { type: { toString: null, valueOf: null } } });
+      }
       emit({ type: "item.completed", item: { type: "agent_message", text: "Working on it." } });
       console.log("CLI notice.");
       emit({ type: "item.completed", item: { type: "agent_message", text: "Done.\nAll set." } });
@@ -214,12 +230,13 @@ async function runServer(f, ...requests) {
   const server = spawn(process.execPath, [SERVER], serverOptions(f));
   const exited = once(server, "close", { signal });
   const replies = [];
+  let receivedReplies = 0;
   let stdoutBuffer = "";
   let stderr = "";
   let ended = false;
 
   const maybeEnd = () => {
-    if (!ended && replies.length >= expectedReplies) {
+    if (!ended && receivedReplies >= expectedReplies) {
       ended = true;
       server.stdin.end();
     }
@@ -231,7 +248,9 @@ async function runServer(f, ...requests) {
     stdoutBuffer = lines.pop() ?? "";
     for (const line of lines) {
       if (line.trim()) {
-        replies.push(JSON.parse(line));
+        const message = JSON.parse(line);
+        replies.push(message);
+        if (Object.hasOwn(message, "id")) receivedReplies++;
       }
     }
     maybeEnd();
@@ -452,6 +471,60 @@ test("ignores relative PATH entries", async (t) => {
 });
 
 const execResult = { sessionId: "thread-123", finalMessage: "Done.\nAll set." };
+
+function progressMessage(progressToken, progress, message) {
+  return { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress, message } };
+}
+
+for (const [name, mode, token, sessionId, itemType, finalMessage] of [
+  ["codex_exec", "", 0, "thread-123", "agent_message", execResult.finalMessage],
+  ["codex_resume", "spaced-progress", "resume-progress", "session-456", "command_execution", "Done."]
+]) {
+  test(`reports ordered ${name} progress`, async (t) => {
+    const f = fixture(t, { mode });
+    const { replies } = await runServer(f, rpc(1, "tools/call", {
+      name, arguments: { cwd: f.cwd, prompt: "Report results." }, _meta: { progressToken: token }
+    }));
+    const expected = [
+      progressMessage(token, 1, `Codex session started: ${sessionId}`),
+      progressMessage(token, 2, `Codex completed step (${itemType})`)
+    ];
+    if (mode === "spaced-progress") expected.push(progressMessage(token, 3, "Codex completed step (agent_message)"));
+    assert.deepEqual(replies, [...expected, {
+      jsonrpc: "2.0", id: 1,
+      result: { content: [{ type: "text", text: JSON.stringify({ sessionId, finalMessage }) }], isError: false }
+    }]);
+  });
+}
+
+test("ignores invalid progress tokens", async (t) => {
+  const f = fixture(t);
+  const tokens = [undefined, null, false, 0.5, Number.MAX_SAFE_INTEGER + 1, {}];
+  const { replies } = await runServer(f, ...tokens.map((progressToken, id) => rpc(id, "tools/call", {
+    name: "codex_exec",
+    arguments: { cwd: f.cwd, prompt: "Report results." },
+    ...(progressToken === undefined ? {} : { _meta: { progressToken } })
+  })));
+  assert.deepEqual(replies.map(({ id }) => id).sort(), tokens.map((_, id) => id));
+  assert.ok(replies.every(({ result }) => result?.isError === false));
+});
+
+test("handles malformed progress metadata", async (t) => {
+  const f = fixture(t, { mode: "malformed-item-type" });
+  const token = "malformed-event";
+  const { replies } = await runServer(f, rpc(1, "tools/call", {
+    name: "codex_exec", arguments: { cwd: f.cwd, prompt: "Report results." }, _meta: { progressToken: token }
+  }));
+  assert.deepEqual(replies, [
+    progressMessage(token, 1, "Codex session started: thread-123"),
+    progressMessage(token, 2, "Codex completed step (item.completed)"),
+    {
+      jsonrpc: "2.0", id: 1,
+      result: { content: [{ type: "text", text: JSON.stringify(execResult) }], isError: false }
+    }
+  ]);
+});
+
 for (const [name, effort, subcommand, timeoutMs] of [
   ["codex_review", "low", "review", 1_800_000],
   ["codex_exec", "medium", "-", 1_000],
@@ -658,7 +731,7 @@ function waitForStatus(f, signal, status) {
   return waitForLog(f, signal, (log) => log.includes(`${JSON.stringify(status)}\n`));
 }
 
-function runHeldCall(f, options = {}) {
+function runHeldCall(f, options = {}, _meta) {
   const signal = AbortSignal.timeout(5_000);
   const server = spawn(process.execPath, [SERVER], serverOptions(f));
   const exited = once(server, "close", { signal });
@@ -670,7 +743,7 @@ function runHeldCall(f, options = {}) {
     const [line] = log.split("\n");
     return line && log.includes("\n") && JSON.parse(line);
   });
-  send(rpc(1, "tools/call", { name: "codex_exec", arguments: { cwd: f.cwd, prompt: "Hold.", ...options } }));
+  send(rpc(1, "tools/call", { name: "codex_exec", arguments: { cwd: f.cwd, prompt: "Hold.", ...options }, _meta }));
   return { server, signal, exited, output, replies, send, started };
 }
 
@@ -692,6 +765,34 @@ test("cancels a running request", async (t) => {
     assert.deepEqual(await exited, [0, null]);
     assert.deepEqual(replies.map(({ id }) => id), [2]);
     assert.equal(replies[0].result.isError, false);
+  } finally {
+    server.kill("SIGKILL");
+    forceKill(pid);
+  }
+});
+
+test("suppresses progress after cancellation", { skip: isWindows && "POSIX signal handlers only" }, async (t) => {
+  const f = fixture(t, { mode: "cancel-progress" });
+  const token = "cancel";
+  const { server, signal, exited, output, replies, send, started } = runHeldCall(f, {}, { progressToken: token });
+  let pid;
+  try {
+    const [invocation] = await Promise.all([started, once(output, "line", { signal })]);
+    pid = invocation.pid;
+    const stopped = waitForStatus(f, signal, "stopped");
+    send(rpc(undefined, "notifications/cancelled", { requestId: 1 }));
+    await stopped;
+    await waitForProcessDeath(pid, signal);
+
+    const pong = once(output, "line", { signal });
+    send(rpc(2, "ping"));
+    await pong;
+    server.stdin.end();
+    assert.deepEqual(await exited, [0, null]);
+    assert.deepEqual(replies, [
+      progressMessage(token, 1, "Codex session started: thread-123"),
+      { jsonrpc: "2.0", id: 2, result: {} }
+    ]);
   } finally {
     server.kill("SIGKILL");
     forceKill(pid);

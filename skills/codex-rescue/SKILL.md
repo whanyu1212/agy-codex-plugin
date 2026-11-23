@@ -9,22 +9,23 @@ description: >-
 
 # Codex Rescue
 
-Delegate a focused diagnosis or implementation task to `codex exec` using
-Antigravity's native `run_command` background execution and reactive wakeup.
+Delegate a focused diagnosis or implementation task with the bundled Codex
+runner and Antigravity's native `run_command` background execution and reactive
+wakeup. Resolve `<plugin-root>` two levels up from the directory containing
+this `SKILL.md`. Run commands from the target repository.
 
 ## Core Rules
 
 - Pass multi-line prompts via stdin heredoc (`<<'EOF'`) to prevent shell-escaping
   bugs.
 - Choose the narrowest sandbox mode that fits the request:
-  - `-s read-only` for diagnosis, research, or second opinions without edits.
-  - `-s workspace-write` (default for implementation/fixes) when Codex should
+  - `--sandbox read-only` for diagnosis, research, or second opinions without edits.
+  - `--sandbox workspace-write` for implementation or fixes when Codex should
     edit files and run checks.
 - Add `--worktree` only when the user explicitly asks for an isolated Git
   worktree.
-- Add `-m <model>` only when the user explicitly specifies a model.
-- For a faster run on a bounded task, optionally add
-  `-c model_reasoning_effort=medium` after `codex exec` and before any subcommand.
+- Add `--model <model>` to `exec` only when the user explicitly specifies a model.
+- For a faster run on a bounded task, optionally add `--effort medium`.
 - If `codex` is missing or unauthenticated, direct the user to `/codex-setup`.
 
 ## Steps
@@ -32,24 +33,35 @@ Antigravity's native `run_command` background execution and reactive wakeup.
 1. **Choose the command mode**:
    - **Fresh read-only diagnosis**:
      ```bash
-     codex exec -s read-only - <<'EOF'
+     node "<plugin-root>/scripts/codex-run.mjs" exec --sandbox read-only <<'EOF'
      <clear problem statement, relevant files, and constraints>
      EOF
      ```
    - **Fresh write-capable task (fix / implement)**:
      ```bash
-     codex exec -s workspace-write - <<'EOF'
+     node "<plugin-root>/scripts/codex-run.mjs" exec --sandbox workspace-write <<'EOF'
      <clear task, acceptance criteria, and verification command>
      EOF
      ```
    - **Continue previous Codex session in this repo** (when the user asks to
      resume/continue/keep going):
      ```bash
-     codex exec -s read-only resume --last - <<'EOF'
+     node "<plugin-root>/scripts/codex-run.mjs" resume --sandbox read-only <<'EOF'
      <follow-up instruction>
      EOF
      ```
-     Use `-s workspace-write` for write-capable follow-ups.
+     Use `--sandbox workspace-write` for write-capable follow-ups or
+     `--session <id>` to resume a specific session.
+
+   If the runner script is unavailable, use `codex exec -s <sandbox> --json -`
+   for a fresh prompt. Keep `--worktree` when requested and translate any
+   `--model <model>` to `-m <model>`. For a follow-up, use
+   `codex exec -s <sandbox> resume --json -- "$session_id" -` with the requested
+   ID in `$session_id`, or `codex exec -s <sandbox> resume --json --last -` for
+   the latest session.
+   Translate `--effort <level>` to `-c model_reasoning_effort=<level>` immediately
+   after `codex exec`. Pass the same prompt on stdin and read the session ID
+   and final message from the Codex event stream.
 
 2. **Execute via `run_command`**:
    - For quick, bounded read-only questions, use `WaitMsBeforeAsync: 10000`.
@@ -59,5 +71,7 @@ Antigravity's native `run_command` background execution and reactive wakeup.
      Antigravity wakes you up with the completion output.
 
 3. **Report results**:
+   - The runner returns JSON with `sessionId` and `finalMessage`. Include the
+     session ID when it would help the user continue the task.
    - Summarize what Codex did or found, include any modified files (`git status --short`),
      and surface any errors or remaining verification needed.

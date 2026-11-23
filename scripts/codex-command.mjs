@@ -125,7 +125,7 @@ export function boundedOutput() {
   };
 }
 
-export function collectExecEvents({ fallbackToStdout = false } = {}) {
+export function collectExecEvents({ fallbackToStdout = false, onEvent } = {}) {
   let line = boundedOutput();
   let sawEvents = false;
   let sessionId = null;
@@ -141,9 +141,13 @@ export function collectExecEvents({ fallbackToStdout = false } = {}) {
       }
       sawEvents = true;
       const [prefix, type] = event;
-      const completedAgentMessage = /^\s*,\s*"item"\s*:\s*\{(?:\s*"id"\s*:\s*"[^"]*"\s*,)?\s*"type"\s*:\s*"agent_message"/;
-      if (type === "agent_message" || (type === "item.completed" && completedAgentMessage.test(text.slice(prefix.length)))) {
-        finalMessage = truncationMarker;
+      if (type === "item.completed" || type === "agent_message") {
+        const completedItem = /^\s*,\s*"item"\s*:\s*\{(?:\s*"id"\s*:\s*"[^"]*"\s*,)?\s*"type"\s*:\s*"([^"]+)"/;
+        const itemType = type === "item.completed" ? (completedItem.exec(text.slice(prefix.length))?.[1] ?? type) : type;
+        if (itemType === "agent_message") {
+          finalMessage = truncationMarker;
+        }
+        onEvent?.({ kind: "item", itemType });
       }
       return;
     }
@@ -161,11 +165,16 @@ export function collectExecEvents({ fallbackToStdout = false } = {}) {
       const id = event.thread_id ?? event.session_id;
       if (typeof id === "string") {
         sessionId = id;
+        onEvent?.({ kind: "session", sessionId: id });
       }
     }
     const item = event.type === "item.completed" ? event.item : event;
     if (item?.type === "agent_message") {
       finalMessage = typeof item.text === "string" ? item.text : null;
+    }
+    if (event.type === "item.completed" || event.type === "agent_message") {
+      const itemType = typeof item?.type === "string" ? item.type : event.type;
+      onEvent?.({ kind: "item", itemType });
     }
   }
 
