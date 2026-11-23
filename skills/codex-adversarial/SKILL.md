@@ -23,10 +23,15 @@ instructions passed via stdin (`-`).
 
 ## Steps
 
-1. **Determine the target scope**:
-   - **Default**: `--uncommitted`
-   - **Base branch** (e.g. `--base main`): `--base <branch>`
-   - **Commit** (e.g. `--commit <sha>`): `--commit <sha>`
+1. **Determine the target scope** (note: `codex review` does not allow `--uncommitted`,
+   `--base`, or `--commit` flags together with a custom prompt, so specify the
+   target scope inside the prompt's `Target:` line):
+   - **Default (uncommitted changes)**:
+     `Target: review the uncommitted changes in this repository (inspect git status and git diff HEAD).`
+   - **Base branch** (e.g. `--base main`):
+     `Target: review the branch diff against <branch> (inspect git diff <branch>...HEAD).`
+   - **Commit** (e.g. `--commit <sha>`):
+     `Target: review commit <sha> (inspect git show <sha>).`
 
 2. **Verify there are changes to review**:
    - Uncommitted: `git status --short --untracked-files=all && git diff --shortstat --cached && git diff --shortstat`
@@ -34,13 +39,15 @@ instructions passed via stdin (`-`).
    - Commit: `git show --stat --oneline <sha>`
    - If nothing changed, inform the user and stop.
 
-3. **Run `codex review` with the adversarial rubric via stdin** (`WaitMsBeforeAsync: 500`
+3. **Run `codex review -` with the adversarial rubric via stdin** (`WaitMsBeforeAsync: 500`
    for medium/large diffs so Antigravity wakes you up when done, or `10000` for
-   tiny 1–2 file diffs). Append any user-specified focus area under
-   `Additional focus`:
+   tiny 1–2 file diffs). Replace the `Target:` line when reviewing a branch or
+   commit, and append any user-specified focus area under `Additional focus`:
 
    ```bash
-   codex review --uncommitted - <<'EOF'
+   codex review - <<'EOF'
+   Target: review the uncommitted changes in this repository (inspect git status and git diff HEAD).
+
    Perform a skeptical, adversarial code review of these changes. Assume bugs are hiding until proven otherwise.
 
    Focus on:
@@ -53,8 +60,5 @@ instructions passed via stdin (`-`).
    Ignore style nits. Report only concrete, evidence-backed findings with file paths, line numbers, failure scenarios, and suggested fixes.
    EOF
    ```
-
-   Replace `--uncommitted` with `--base <branch>` or `--commit <sha>` when the
-   user specifies a branch or commit.
 
 4. **Present the findings** directly to the user without altering any files.

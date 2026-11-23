@@ -28,8 +28,8 @@ parent agent.
 3. Choose the matching `codex` invocation:
    - **Standard review**:
      `codex review --uncommitted` (or `--base <branch>` / `--commit <sha>`).
-   - **Focused/adversarial review**:
-     `codex review --uncommitted - <<'EOF' ... EOF`
+   - **Focused/adversarial review** (`codex review` forbids combining `--uncommitted`/`--base`/`--commit` with a prompt, so put the git target inside the stdin prompt):
+     `codex review - <<'EOF' ... EOF`
    - **Read-only diagnosis / second opinion**:
      `codex exec -s read-only - <<'EOF' ... EOF`
    - **Write-capable rescue / implementation**:

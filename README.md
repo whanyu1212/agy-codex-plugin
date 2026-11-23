@@ -1,8 +1,49 @@
 # agy-codex-plugin
 
-A minimal, zero-broker Antigravity (`agy`) plugin that lets Antigravity delegate code reviews, adversarial audits, and rescue tasks to your local OpenAI **Codex CLI** (`codex`).
+A minimal, zero-broker **Antigravity (`agy`)** plugin for delegating code reviews, adversarial audits, and debugging or implementation tasks to your local OpenAI **Codex CLI** (`codex`).
 
-Instead of bundling a background daemon or reimplementing job queues, this plugin pairs `codex`'s public non-interactive CLI (`codex review`, `codex exec`, `codex doctor`) with Antigravity's native skills, background `run_command` wakeup, custom subagents, and lifecycle hooks.
+## Why This Architecture (Zero-Broker Design)
+
+Instead of shipping a custom background daemon, a JSON-RPC app-server client, or a duplicate job tracker, `agy-codex-plugin` pairs **Codex's stable non-interactive CLI** (`codex review`, `codex exec`, `codex doctor`) with **Antigravity's native primitives**:
+
+- **Skills (`/<skill-name>`)** expose `/codex-review`, `/codex-adversarial`, `/codex-rescue`, and `/codex-setup` with zero wrapper code.
+- **Reactive `run_command` background wakeup** lets long-running `codex` runs execute asynchronously and wake Antigravity up when finished—no `/status`, `/result`, or `/cancel` polling needed.
+- **Custom subagent (`codex-delegate`)** lets Antigravity delegate second opinions or isolated Codex runs in the background.
+- **Native `Stop` hook (`hooks.json`)** optionally checks uncommitted changes before Antigravity finishes a turn, using `continuationActive` to prevent loops and failing open on errors.
+
+```mermaid
+flowchart LR
+    U["User / Antigravity Session"] --> S["Skills (/codex-review, /codex-adversarial, /codex-rescue, /codex-setup)"]
+    U --> A["Subagent (codex-delegate)"]
+    U --> H["Opt-in Stop Hook (scripts/stop-review-gate.mjs)"]
+    S --> C["Local Codex CLI (codex review / codex exec / codex doctor)"]
+    A --> C
+    H --> C
+    C --> R["Local Git Repository"]
+```
+
+## Repository Layout
+
+```text
+agy-codex-plugin/
+├── plugin.json                        # Antigravity plugin manifest (name: codex-cli)
+├── README.md
+├── LICENSE                            # MIT
+├── assets/
+│   └── logo.svg                       # 128x128 plugin icon
+├── skills/
+│   ├── codex-review/SKILL.md          # /codex-review (read-only codex review)
+│   ├── codex-adversarial/SKILL.md     # /codex-adversarial (skeptical challenge review)
+│   ├── codex-rescue/SKILL.md          # /codex-rescue (delegated codex exec + resume --last)
+│   └── codex-setup/SKILL.md           # /codex-setup (install & codex doctor check)
+├── agents/
+│   └── codex-delegate.md              # Background subagent wrapper around codex CLI
+├── hooks.json                         # Opt-in Stop review gate (disabled by default)
+├── scripts/
+│   └── stop-review-gate.mjs           # Zero-dependency Node ESM Stop hook
+└── tests/
+    └── stop-review-gate.test.mjs      # Deterministic unit tests with fake codex stub
+```
 
 ## Prerequisites
 
@@ -13,11 +54,11 @@ Instead of bundling a background daemon or reimplementing job queues, this plugi
    # or
    npm install -g @openai/codex
 
-   # Authenticate
+   # Authenticate (ChatGPT subscription or OPENAI_API_KEY)
    codex login
    ```
 2. **Antigravity** (`agy` CLI, Antigravity App, or Antigravity IDE).
-3. **Node.js** (only needed if you enable the optional `Stop` review-gate hook).
+3. **Node.js** (only required if you enable the optional `Stop` hook).
 
 ## Installation
 
@@ -34,7 +75,7 @@ git clone https://github.com/whanyu1212/agy-codex-plugin.git
 agy plugin install ./agy-codex-plugin
 ```
 
-Verify installation:
+Verify the plugin is enabled, then run `/codex-setup` inside Antigravity to verify `codex doctor`:
 
 ```bash
 agy plugin list
@@ -42,28 +83,44 @@ agy plugin list
 
 ## Slash Commands (Skills)
 
-| Command | What it does | Underlying Codex command |
+| Command | Purpose | Underlying Codex CLI |
 | :--- | :--- | :--- |
 | `/codex-review` | Read-only review of uncommitted changes, `--base <branch>`, or `--commit <sha>` | `codex review` |
-| `/codex-adversarial` | Skeptical challenge review probing assumptions, concurrency, edge cases, and security | `codex review ... -` |
-| `/codex-rescue` | Delegate diagnosis (`read-only`) or fixes (`workspace-write`), including `resume --last` | `codex exec` |
-| `/codex-setup` | Check `codex` installation, version, and authentication health | `codex doctor` |
+| `/codex-adversarial` | Skeptical challenge review probing invariants, concurrency, edge cases, and security | `codex review -` |
+| `/codex-rescue` | Delegate diagnosis (`-s read-only`), fixes (`-s workspace-write`), or `resume --last` | `codex exec` |
+| `/codex-setup` | Check `codex` binary, version, and authentication health | `codex doctor` |
 
-## Subagent
+### Examples
 
-- **`codex-delegate`** (`agents/codex-delegate.md`): A lightweight `flash` subagent that Antigravity can spawn in the background for second opinions, reviews, or delegated `codex exec` runs without blocking your main conversation.
+- `/codex-review` — review current uncommitted changes (read-only).
+- `/codex-review --base main` — review your branch diff against `main`.
+- `/codex-adversarial focus on auth and race conditions` — stress-test changes with a skeptical rubric piped over stdin (`<<'EOF'`), avoiding shell-quoting issues and `codex review`'s `--uncommitted` + prompt conflict.
+- `/codex-rescue diagnose why tests/auth.test.ts is flaky` — run a read-only second-opinion diagnosis.
+- `/codex-rescue fix the race in src/queue.ts and run unit tests` — delegate edits inside Codex's `workspace-write` sandbox (`--worktree` when isolated changes are requested, or `codex exec resume --last` to continue prior work).
+
+## Subagent (`codex-delegate`)
+
+[`agents/codex-delegate.md`](agents/codex-delegate.md) registers a lightweight `flash` background subagent (`subagent: true`, `mainAgent: false`) so Antigravity can offload a second opinion, review, or `codex exec` run without blocking your main conversation.
 
 ## Optional Stop Review Gate (`hooks.json`)
 
-The plugin ships with an **opt-in** `Stop` hook (`codex-stop-review-gate`) that runs a fast, read-only `codex exec --ephemeral` check on uncommitted git changes before Antigravity finishes a turn, continuing the loop if Codex flags concrete bugs or regressions.
+The plugin ships with an **opt-in** `Stop` hook (`codex-stop-review-gate`) powered by [`scripts/stop-review-gate.mjs`](scripts/stop-review-gate.mjs). When enabled, it runs `codex exec -s read-only --ephemeral` on uncommitted changes before Antigravity ends a turn and continues the loop if Codex reports concrete bugs, regressions, or security issues.
 
-It is **disabled by default** (`"enabled": false` in `hooks.json`) so normal sessions stay fast. To enable it, edit `hooks.json` in your installed plugin directory and set `"enabled": true`.
+To keep normal turns fast, it is **disabled by default** (`"enabled": false` in [`hooks.json`](hooks.json)) and **fails open** (`{}`) whenever:
+- `continuationActive` is `true` (prevents infinite review loops)
+- `terminationReason` is not `NO_TOOL_CALL`
+- the workspace is not a git repo or has no uncommitted changes
+- `codex` is unavailable, times out, or exits non-zero
 
-## Local Validation
+To enable it, set `"enabled": true` in `hooks.json` inside your installed plugin directory (`~/.gemini/config/plugins/codex-cli/hooks.json`).
 
-Validate the plugin structure and manifest with:
+## Development & Testing
 
 ```bash
+# Run deterministic Stop hook unit tests (uses a fake codex stub on PATH)
+node --test tests/stop-review-gate.test.mjs
+
+# Validate manifest, skills, subagent, and hooks strictly
 agy plugin validate --strict .
 ```
 
