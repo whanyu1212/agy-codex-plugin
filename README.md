@@ -4,7 +4,7 @@ A minimal, zero-broker **Antigravity (`agy`)** plugin for delegating code review
 
 ## Why This Architecture (Zero-Broker Design)
 
-Instead of shipping a custom background daemon, a JSON-RPC app-server client, or a duplicate job tracker, `agy-codex-plugin` pairs **Codex's stable non-interactive CLI** (`codex review`, `codex exec`, `codex doctor`) with **Antigravity's native primitives**:
+Instead of shipping a custom background daemon, a JSON-RPC app-server client, or a duplicate job tracker, `agy-codex-plugin` pairs **Codex's stable non-interactive CLI** (`codex exec -s read-only review`, `codex exec`, `codex doctor`) with **Antigravity's native primitives**:
 
 - **Skills (`/<skill-name>`)** expose `/codex-review`, `/codex-adversarial`, `/codex-rescue`, and `/codex-setup` with zero wrapper code.
 - **Reactive `run_command` background wakeup** lets long-running `codex` runs execute asynchronously and wake Antigravity up when finished—no `/status`, `/result`, or `/cancel` polling needed.
@@ -18,7 +18,7 @@ flowchart LR
     U --> A["Subagent (codex-delegate)"]
     U --> H["Opt-in Stop Hook (scripts/stop-review-gate.mjs)"]
     U --> M["MCP Server (scripts/mcp-server.mjs)"]
-    S --> C["Local Codex CLI (codex review / codex exec / codex doctor)"]
+    S --> C["Local Codex CLI (codex exec / codex doctor)"]
     A --> C
     H --> C
     M --> C
@@ -36,7 +36,7 @@ agy-codex-plugin/
 ├── assets/
 │   └── logo.svg                       # 128x128 plugin icon
 ├── skills/
-│   ├── codex-review/SKILL.md          # /codex-review (read-only codex review)
+│   ├── codex-review/SKILL.md          # /codex-review (read-only code review)
 │   ├── codex-adversarial/SKILL.md     # /codex-adversarial (skeptical challenge review)
 │   ├── codex-rescue/SKILL.md          # /codex-rescue (delegated codex exec + resume --last)
 │   └── codex-setup/SKILL.md           # /codex-setup (install & codex doctor check)
@@ -45,7 +45,8 @@ agy-codex-plugin/
 ├── hooks.json                         # Opt-in Stop review gate (disabled by default)
 ├── scripts/
 │   ├── mcp-server.mjs                 # Zero-dependency Node ESM stdio MCP server
-│   └── stop-review-gate.mjs           # Zero-dependency Node ESM Stop hook
+│   ├── stop-review-gate.mjs           # Zero-dependency Node ESM Stop hook
+│   └── codex-command.mjs              # Shared subprocess launch and cleanup
 └── tests/
     ├── mcp-server.test.mjs            # MCP protocol and Codex invocation tests
     └── stop-review-gate.test.mjs      # Stop hook tests
@@ -91,8 +92,8 @@ agy plugin list
 
 | Command | Purpose | Underlying Codex CLI |
 | :--- | :--- | :--- |
-| `/codex-review` | Read-only review of uncommitted changes, `--base <branch>`, or `--commit <sha>` | `codex review` |
-| `/codex-adversarial` | Skeptical challenge review probing invariants, concurrency, edge cases, and security | `codex review -` |
+| `/codex-review` | Read-only review of uncommitted changes, `--base <branch>`, or `--commit <sha>` | `codex exec -s read-only review` |
+| `/codex-adversarial` | Skeptical challenge review probing invariants, concurrency, edge cases, and security | `codex exec -s read-only review -` |
 | `/codex-rescue` | Delegate diagnosis (`-s read-only`), fixes (`-s workspace-write`), or `resume --last` | `codex exec` |
 | `/codex-setup` | Check `codex` binary, version, and authentication health | `codex doctor` |
 
@@ -100,9 +101,11 @@ agy plugin list
 
 - `/codex-review` — review current uncommitted changes (read-only).
 - `/codex-review --base main` — review your branch diff against `main`.
-- `/codex-adversarial focus on auth and race conditions` — stress-test changes with a skeptical rubric piped over stdin (`<<'EOF'`), avoiding shell-quoting issues and `codex review`'s `--uncommitted` + prompt conflict.
+- `/codex-adversarial focus on auth and race conditions` — stress-test changes with a skeptical rubric piped over stdin (`<<'EOF'`). The rubric names the review target because the CLI accepts either a target flag or a custom prompt.
 - `/codex-rescue diagnose why tests/auth.test.ts is flaky` — run a read-only second-opinion diagnosis.
 - `/codex-rescue fix the race in src/queue.ts and run unit tests` — delegate edits inside Codex's `workspace-write` sandbox (`--worktree` when isolated changes are requested, or `codex exec resume --last` to continue prior work).
+
+For a faster CLI run on a bounded task, you can pass `-c model_reasoning_effort=medium` after `codex exec`. For example, run `codex exec -s read-only -c model_reasoning_effort=medium review --uncommitted`.
 
 ## Subagent (`codex-delegate`)
 
@@ -118,6 +121,10 @@ Antigravity starts the bundled `codex` stdio server using [`mcp_config.json`](mc
 | `codex_exec` | Required `cwd` and `prompt`. Optional `sandbox` defaults to `read-only` and also accepts `workspace-write`. Optional `model`, `worktree`, and `ephemeral`. | JSON text with `sessionId` and `finalMessage`. |
 | `codex_resume` | Required `cwd` and `prompt`. Optional `sessionId` selects a session by ID or name. Omit it to select the most recent session in `cwd`. Optional `sandbox` defaults to `read-only` and also accepts `workspace-write`. | JSON text with `sessionId` and `finalMessage`. |
 | `codex_doctor` | Optional `cwd`. | Codex version and local diagnostic output. |
+
+Review, exec, and resume accept optional `effort` values of `low`, `medium`, or `high` to override Codex's configured reasoning effort. For example, use `"effort": "medium"` for a bounded review.
+
+All four tools accept an optional integer `timeoutMs` from 1,000 to 1,800,000 milliseconds. The default is 600,000 ms (10 minutes) for review, exec, and resume, and 60,000 ms (1 minute) for doctor. The limit covers the tool's entire command sequence, including review ref resolution and doctor fallback. On timeout the server terminates the active process tree and returns `isError: true` with the tool name and time limit.
 
 With a custom review `prompt`, the server includes the selected target in the instructions sent to Codex. It uses Git in `cwd` to resolve a base or commit ref to a full commit SHA and returns a tool error if the ref cannot be resolved. Use either `worktree` or `ephemeral` for an exec call because Codex rejects the combination. Ephemeral sessions are available only for the duration of the call.
 
@@ -160,6 +167,8 @@ To keep normal turns fast, it is **disabled by default** (`"enabled": false` in 
 To enable it, set `"enabled": true` in `hooks.json` inside your installed plugin directory (`~/.gemini/config/plugins/codex-cli/hooks.json`).
 
 ## Development & Testing
+
+GitHub Actions runs both test files on Node.js 22 across Linux, macOS, and Windows on pushes to `main` and on pull requests. See the [CI workflow](.github/workflows/ci.yml).
 
 ```bash
 # Run deterministic tests with a fake codex on PATH

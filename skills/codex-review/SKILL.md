@@ -2,14 +2,14 @@
 name: codex-review
 description: >-
   Run a read-only code review against local git changes using the OpenAI Codex
-  CLI (`codex review`). Use when the user invokes `/codex-review` or asks for a
+  CLI (`codex exec -s read-only review`). Use when the user invokes `/codex-review` or asks for a
   Codex review of uncommitted changes, a branch diff (`--base`), or a specific
   commit (`--commit`).
 ---
 
 # Codex Review
 
-Run a non-interactive, read-only code review using the local `codex review`
+Run a non-interactive code review using the local `codex exec -s read-only review`
 command.
 
 ## Core Rules
@@ -24,11 +24,11 @@ command.
 ## Steps
 
 1. **Determine the review target** from the user's request:
-   - **Default (uncommitted changes)**: `codex review --uncommitted`
+   - **Default (uncommitted changes)**: `codex exec -s read-only review --uncommitted`
    - **Branch diff** (e.g. `--base main` or "against main"):
-     `codex review --base <branch>`
+     `codex exec -s read-only review --base <branch>`
    - **Single commit** (e.g. `--commit <sha>`):
-     `codex review --commit <sha>`
+     `codex exec -s read-only review --commit <sha>`
 
 2. **Check git state first** so you do not run an empty review and can choose
    foreground vs. background execution:
@@ -40,7 +40,7 @@ command.
      `git show --stat --oneline <sha>`
    - If there are no changes to review, report that clearly and stop.
 
-3. **Run `codex review` via `run_command`**:
+3. **Run `codex exec -s read-only review` via `run_command`**:
    - **Small diff** (roughly 1–2 files changed): run in the foreground with
      `WaitMsBeforeAsync: 10000`.
    - **Larger or unclear diff**: launch with `WaitMsBeforeAsync: 500` so the
@@ -50,9 +50,9 @@ command.
 
    Examples:
    ```bash
-   codex review --uncommitted
-   codex review --base main
-   codex review --commit abc1234
+   codex exec -s read-only review --uncommitted
+   codex exec -s read-only review --base main
+   codex exec -s read-only review --commit abc1234
    ```
 
 4. **Return the review output** cleanly to the user without modifying any files.

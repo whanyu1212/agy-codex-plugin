@@ -2,14 +2,14 @@
 name: codex-adversarial
 description: >-
   Run a skeptical, adversarial challenge review against local git changes using
-  `codex review` with a custom stress-test prompt. Use when the user invokes
+  `codex exec -s read-only review` with a custom stress-test prompt. Use when the user invokes
   `/codex-adversarial` or asks Codex to challenge assumptions, hunt for race
   conditions, security holes, edge cases, or regressions.
 ---
 
 # Codex Adversarial Review
 
-Run a skeptical, steerable challenge review using `codex review` with custom
+Run a skeptical, steerable challenge review using `codex exec -s read-only review` with custom
 instructions passed via stdin (`-`).
 
 ## Core Rules
@@ -23,7 +23,7 @@ instructions passed via stdin (`-`).
 
 ## Steps
 
-1. **Determine the target scope** (note: `codex review` does not allow `--uncommitted`,
+1. **Determine the target scope** (the review command does not allow `--uncommitted`,
    `--base`, or `--commit` flags together with a custom prompt, so specify the
    target scope inside the prompt's `Target:` line):
    - **Default (uncommitted changes)**:
@@ -39,13 +39,13 @@ instructions passed via stdin (`-`).
    - Commit: `git show --stat --oneline <sha>`
    - If nothing changed, inform the user and stop.
 
-3. **Run `codex review -` with the adversarial rubric via stdin** (`WaitMsBeforeAsync: 500`
+3. **Run `codex exec -s read-only review -` with the adversarial rubric via stdin** (`WaitMsBeforeAsync: 500`
    for medium/large diffs so Antigravity wakes you up when done, or `10000` for
    tiny 1–2 file diffs). Replace the `Target:` line when reviewing a branch or
    commit, and append any user-specified focus area under `Additional focus`:
 
    ```bash
-   codex review - <<'EOF'
+   codex exec -s read-only review - <<'EOF'
    Target: review the uncommitted changes in this repository (inspect git status and git diff HEAD).
 
    Perform a skeptical, adversarial code review of these changes. Assume bugs are hiding until proven otherwise.
