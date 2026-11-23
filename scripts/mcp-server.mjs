@@ -55,7 +55,7 @@ const tools = [
   },
   {
     name: "codex_exec",
-    description: "Run a Codex prompt and return the session ID and final agent message.",
+    description: "Run a Codex prompt and return sessionId, resumable, repoRoot, worktreePath, and finalMessage.",
     inputSchema: {
       type: "object",
       properties: {
@@ -75,14 +75,24 @@ const tools = [
   },
   {
     name: "codex_resume",
-    description: "Continue a Codex session by ID or name, or resume the most recent session in the working directory. "
-      + "In Codex 0.171.0, a missing UUID returns an error. An unknown name or no recent session starts a new session.",
+    description: "Continue a specific Codex session by explicit sessionId (recommended), or pass last: true to opt into "
+      + "resuming the most recent session in cwd. If the prior run returned worktreePath, pass it as cwd (or codex_resume "
+      + "routes to the owned worktree when discoverable in the repo). Requires fresh write authorization before upgrading "
+      + "a read-only session to workspace-write. Returns sessionId, resumable, repoRoot, worktreePath, and finalMessage.",
     inputSchema: {
       type: "object",
       properties: {
         cwd: cwdProperty,
         prompt: promptProperty,
-        sessionId: { type: "string", minLength: 1, description: "Session to resume. Omit to use --last." },
+        sessionId: {
+          type: "string",
+          minLength: 1,
+          description: "Exact session ID (or thread name) from a prior run. Required unless last is true."
+        },
+        last: {
+          type: "boolean",
+          description: "Explicitly opt in to resuming the most recent session in cwd instead of a specific sessionId."
+        },
         sandbox: sandboxProperty,
         effort: effortProperty,
         timeoutMs: timeoutProperty

@@ -130,6 +130,7 @@ export function collectExecEvents({ fallbackToStdout = false, onEvent } = {}) {
   let sawEvents = false;
   let sessionId = null;
   let finalMessage = null;
+  let worktreePath = null;
 
   function parseLine() {
     const text = cleanOutput(line.text());
@@ -168,6 +169,12 @@ export function collectExecEvents({ fallbackToStdout = false, onEvent } = {}) {
         onEvent?.({ kind: "session", sessionId: id });
       }
     }
+    if (event.type === "thread.started" || event.type === "session.started" || event.type === "worktree.created") {
+      const candidate = event.worktree_path ?? event.worktreePath ?? event.worktree?.path;
+      if (typeof candidate === "string" && candidate.trim()) {
+        worktreePath = candidate;
+      }
+    }
     const item = event.type === "item.completed" ? event.item : event;
     if (item?.type === "agent_message") {
       finalMessage = typeof item.text === "string" ? item.text : null;
@@ -191,7 +198,11 @@ export function collectExecEvents({ fallbackToStdout = false, onEvent } = {}) {
     },
     finish(stdout) {
       parseLine();
-      return { sessionId, finalMessage: !sawEvents && fallbackToStdout ? cleanOutput(stdout) : finalMessage };
+      return {
+        sessionId,
+        finalMessage: !sawEvents && fallbackToStdout ? cleanOutput(stdout) : finalMessage,
+        worktreePath
+      };
     }
   };
 }
@@ -248,12 +259,16 @@ async function terminateProcessTree(child, isRunning) {
 }
 
 export function runCommand(command, args, {
-  cwd, input, signal, events, label, ignoreStderr = false, failOnTruncatedOutput = false
+  cwd, input, signal, events, label, ignoreStderr = false, failOnTruncatedOutput = false, env
 }) {
   signal.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd, stdio: ["pipe", "pipe", ignoreStderr ? "ignore" : "pipe"], detached: useProcessGroups, windowsHide: true
+      cwd,
+      ...(env ? { env } : {}),
+      stdio: ["pipe", "pipe", ignoreStderr ? "ignore" : "pipe"],
+      detached: useProcessGroups,
+      windowsHide: true
     });
     const stdout = boundedOutput();
     const stderr = boundedOutput();

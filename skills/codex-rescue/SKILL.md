@@ -43,22 +43,34 @@ this `SKILL.md`. Run commands from the target repository.
      <clear task, acceptance criteria, and verification command>
      EOF
      ```
-   - **Continue previous Codex session in this repo** (when the user asks to
-     resume/continue/keep going):
+   - **Continue a specific Codex session** (default when resuming a prior task):
      ```bash
-     node "<plugin-root>/scripts/codex-run.mjs" resume --sandbox read-only <<'EOF'
+     node "<plugin-root>/scripts/codex-run.mjs" resume --session "<sessionId>" --sandbox read-only <<'EOF'
      <follow-up instruction>
      EOF
      ```
-     Use `--sandbox workspace-write` for write-capable follow-ups or
-     `--session <id>` to resume a specific session.
+     Pass the exact `sessionId` returned by the earlier `exec` (or `resume`) run.
+     If the prior run returned a non-null `worktreePath`, pass `--cwd "<worktreePath>"`
+     so the follow-up runs inside the isolated worktree rather than the main checkout.
+     Only pass `--last` when the user explicitly asks to resume the latest
+     session in the repository and no `sessionId` is available:
+     ```bash
+     node "<plugin-root>/scripts/codex-run.mjs" resume --last --sandbox read-only <<'EOF'
+     <follow-up instruction>
+     EOF
+     ```
+     Use `--sandbox workspace-write` only when the task requires edits; if the
+     prior session was `read-only`, get explicit user authorization to write
+     before upgrading to `--sandbox workspace-write`.
 
    If the runner script is unavailable, use `codex exec -s <sandbox> --json -`
    for a fresh prompt. Keep `--worktree` when requested and translate any
-   `--model <model>` to `-m <model>`. For a follow-up, use
-   `codex exec -s <sandbox> resume --json -- "$session_id" -` with the requested
-   ID in `$session_id`, or `codex exec -s <sandbox> resume --json --last -` for
-   the latest session.
+   `--model <model>` to `-m <model>`. For a follow-up, default to
+   `codex exec -s <sandbox> resume --json -- "$session_id" -` with the exact
+   session ID in `$session_id` (run from `<worktreePath>` via
+   `cd "<worktreePath>" && ...` when the prior run created a worktree); only use
+   `codex exec -s <sandbox> resume --json --last -` when the user explicitly opts
+   in to resuming the latest session.
    Translate `--effort <level>` to `-c model_reasoning_effort=<level>` immediately
    after `codex exec`. Pass the same prompt on stdin and read the session ID
    and final message from the Codex event stream.
@@ -71,7 +83,12 @@ this `SKILL.md`. Run commands from the target repository.
      Antigravity wakes you up with the completion output.
 
 3. **Report results**:
-   - The runner returns JSON with `sessionId` and `finalMessage`. Include the
-     session ID when it would help the user continue the task.
+   - The runner returns JSON with `sessionId`, `resumable`, `repoRoot`,
+     `worktreePath`, and `finalMessage`. Always report `sessionId`, `resumable`,
+     and `worktreePath` (when non-null) so follow-ups target the exact task and
+     worktree.
+   - If `resumable` is `false` (for example, an `--ephemeral` run or missing
+     session ID) or `resume` reports a missing/non-resumable session, explain
+     why it cannot be continued and offer to start a fresh `exec` run.
    - Summarize what Codex did or found, include any modified files (`git status --short`),
      and surface any errors or remaining verification needed.
