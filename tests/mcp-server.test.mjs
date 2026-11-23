@@ -154,7 +154,7 @@ if (mode === "lingering-pipe") {
 function fixture(t, { mode = "", withCodex = true } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-mcp-"));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
-  const root = fs.realpathSync(temp);
+  const root = fs.realpathSync.native(temp);
   const cwd = path.join(root, "project with spaces");
   const bin = path.join(root, "bin");
   const log = path.join(root, "codex.jsonl");
@@ -272,6 +272,7 @@ async function invoke(f, name, args) {
 }
 
 test("initializes and lists typed tools", async (t) => {
+  const { version } = JSON.parse(fs.readFileSync(new URL("../plugin.json", import.meta.url), "utf8"));
   const { replies, invocations } = await runServer(
     fixture(t),
     rpc("init", "initialize", { protocolVersion: "2025-06-18" }),
@@ -286,7 +287,7 @@ test("initializes and lists typed tools", async (t) => {
   const initialize = {
     protocolVersion: "2025-06-18",
     capabilities: { tools: {} },
-    serverInfo: { name: "codex-cli", version: "0.2.1" }
+    serverInfo: { name: "codex-cli", version }
   };
   assert.deepEqual(invocations, []);
   assert.deepEqual(replies.map(({ jsonrpc, id }) => [jsonrpc, id]), [
@@ -341,6 +342,29 @@ test("initializes and lists typed tools", async (t) => {
       assert.deepEqual(properties.effort.enum, ["low", "medium", "high"]);
     }
   }
+});
+
+test("exec resolves symlink traversal", async (t) => {
+  const f = fixture(t);
+  const child = path.join(f.cwd, "child");
+  const link = path.join(f.root, "linked");
+  fs.mkdirSync(child);
+  try {
+    fs.symlinkSync(isWindows ? f.cwd : child, link, "dir");
+  } catch (error) {
+    if (isWindows && ["EPERM", "EACCES"].includes(error.code)) {
+      t.skip("Creating symlinks requires permission on Windows");
+      return;
+    }
+    throw error;
+  }
+
+  // Windows normalizes ".." before following symlinks.
+  const cwd = isWindows ? `${link}\\child\\..` : `${link}/..`;
+  const { isError, invocations } = await invoke(f, "codex_exec", { cwd, prompt: "Hello" });
+
+  assert.equal(isError, false);
+  assert.deepEqual(invocations.map(({ argv }) => argv), [["exec", "--json", "-s", "read-only", "-C", f.cwd, "-"]]);
 });
 
 for (const [label, options] of [

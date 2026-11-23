@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
-import path from "node:path";
 import process from "node:process";
 import { cleanOutput, collectExecEvents, runCodex, runGit } from "./codex-command.mjs";
 
@@ -110,7 +109,9 @@ async function main() {
     return;
   }
 
-  const cwd = typeof input.cwd === "string" && input.cwd ? path.resolve(input.cwd) : "";
+  const cwd = typeof input.cwd === "string" && input.cwd
+    ? await fs.promises.realpath(input.cwd).catch(() => null)
+    : null;
   const directory = cwd ? await fs.promises.stat(cwd).catch(() => null) : null;
   if (!directory?.isDirectory()) {
     process.stdout.write("{}\n");
