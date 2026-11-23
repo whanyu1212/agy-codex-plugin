@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,23 +11,40 @@ const useProcessGroups = process.platform !== "win32";
 const activeChildren = new Set();
 export const truncationMarker = "[output truncated]";
 
+function pathDirectories() {
+  const windows = process.platform === "win32";
+  return (process.env.PATH ?? "").split(path.delimiter)
+    .map((directory) => directory.replace(/^"|"$/g, ""))
+    // Windows also considers paths rooted on the current drive absolute.
+    .filter((directory) => path.isAbsolute(directory) && (!windows || path.parse(directory).root.length > 1));
+}
+
 async function isFile(file) {
   const stat = await fs.stat(file).catch(() => null);
   return stat?.isFile() ?? false;
 }
 
-async function resolveWindowsCodex(args, signal) {
-  const directories = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
-  for (const directory of directories) {
+async function resolveExecutable(name, signal) {
+  const windows = process.platform === "win32";
+  for (const directory of pathDirectories()) {
     signal.throwIfAborted();
-    const executable = path.resolve(directory.replace(/^"|"$/g, ""), "codex.exe");
-    if (await isFile(executable)) {
-      return [executable, args];
+    const executable = path.join(directory, name);
+    if (await isFile(executable)
+      && (windows || await fs.access(executable, constants.X_OK).then(() => true, () => false))) {
+      return executable;
     }
   }
-  for (const directory of directories) {
+  return null;
+}
+
+async function resolveWindowsCodex(args, signal) {
+  const executable = await resolveExecutable("codex.exe", signal);
+  if (executable) {
+    return [executable, args];
+  }
+  for (const directory of pathDirectories()) {
     signal.throwIfAborted();
-    const shim = path.resolve(directory.replace(/^"|"$/g, ""), "codex.cmd");
+    const shim = path.join(directory, "codex.cmd");
     const contents = await fs.readFile(shim, { encoding: "utf8", signal }).catch(() => "");
     signal.throwIfAborted();
     // Read npm's generated Node entrypoint without evaluating the batch file.
@@ -41,6 +58,27 @@ async function resolveWindowsCodex(args, signal) {
   }
   signal.throwIfAborted();
   throw new Error("Could not start Codex. Check PATH for codex.exe or an npm-generated codex.cmd.");
+}
+
+async function resolveCodex(args, signal) {
+  if (!useProcessGroups) {
+    return resolveWindowsCodex(args, signal);
+  }
+  const executable = await resolveExecutable("codex", signal);
+  if (executable) {
+    return [executable, args];
+  }
+  signal.throwIfAborted();
+  throw new Error("Could not start Codex. Check that Codex is installed and available on PATH.");
+}
+
+async function resolveGit(signal) {
+  const executable = await resolveExecutable(process.platform === "win32" ? "git.exe" : "git", signal);
+  if (executable) {
+    return executable;
+  }
+  signal.throwIfAborted();
+  throw new Error("Could not start Git. Check that Git is installed and available on PATH.");
 }
 
 export async function withAbort(signal, start) {
@@ -83,6 +121,68 @@ export function boundedOutput() {
     },
     text() {
       return (buffer?.toString("utf8", 0, size) ?? "") + (truncated ? `\n${truncationMarker}` : "");
+    }
+  };
+}
+
+export function collectExecEvents({ fallbackToStdout = false } = {}) {
+  let line = boundedOutput();
+  let sawEvents = false;
+  let sessionId = null;
+  let finalMessage = null;
+
+  function parseLine() {
+    const text = cleanOutput(line.text());
+    if (line.truncated) {
+      // Codex writes the event type before the payload, including oversized items.
+      const event = /^\{\s*"type"\s*:\s*"([^"]+)"/.exec(text);
+      if (!event) {
+        return;
+      }
+      sawEvents = true;
+      const [prefix, type] = event;
+      const completedAgentMessage = /^\s*,\s*"item"\s*:\s*\{(?:\s*"id"\s*:\s*"[^"]*"\s*,)?\s*"type"\s*:\s*"agent_message"/;
+      if (type === "agent_message" || (type === "item.completed" && completedAgentMessage.test(text.slice(prefix.length)))) {
+        finalMessage = truncationMarker;
+      }
+      return;
+    }
+    let event;
+    try {
+      event = JSON.parse(text);
+    } catch {
+      return;
+    }
+    if (typeof event?.type !== "string") {
+      return;
+    }
+    sawEvents = true;
+    if (event.type === "thread.started" || event.type === "session.started") {
+      const id = event.thread_id ?? event.session_id;
+      if (typeof id === "string") {
+        sessionId = id;
+      }
+    }
+    const item = event.type === "item.completed" ? event.item : event;
+    if (item?.type === "agent_message") {
+      finalMessage = typeof item.text === "string" ? item.text : null;
+    }
+  }
+
+  return {
+    append(chunk) {
+      let start = 0;
+      for (let end = chunk.indexOf(10); end !== -1; end = chunk.indexOf(10, start)) {
+        line.append(chunk.subarray(start, end));
+        parseLine();
+        line = boundedOutput();
+        start = end + 1;
+      }
+      line.append(chunk.subarray(start));
+    },
+    finish(stdout) {
+      parseLine();
+      return { sessionId, finalMessage: !sawEvents && fallbackToStdout ? cleanOutput(stdout) : finalMessage };
     }
   };
 }
@@ -223,10 +323,13 @@ export function runCommand(command, args, {
 
 export async function runCodex(args, options) {
   // A PATH entry can be on a network share, and fs.stat cannot be aborted.
-  const [command, argv] = useProcessGroups
-    ? ["codex", args]
-    : await withAbort(options.signal, () => resolveWindowsCodex(args, options.signal));
+  const [command, argv] = await withAbort(options.signal, () => resolveCodex(args, options.signal));
   return runCommand(command, argv, { ...options, label: "Codex" });
+}
+
+export async function runGit(args, options) {
+  const gitPath = await withAbort(options.signal, () => resolveGit(options.signal));
+  return runCommand(gitPath, args, { ...options, label: "Git" });
 }
 
 export async function terminateActiveCommands() {
