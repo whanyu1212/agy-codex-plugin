@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -105,26 +105,73 @@ function serverOptions({ root, bin, log, mode }) {
   };
 }
 
-function runServer(f, ...requests) {
-  const input = requests.map((request) => typeof request === "string" ? request : JSON.stringify(request));
-  const result = spawnSync(process.execPath, [SERVER], {
-    ...serverOptions(f),
-    input: input.join("\n") + "\n",
-    encoding: "utf8",
-    timeout: 10_000
-  });
-  assert.ifError(result.error);
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, "");
-  const parseLines = (text) => text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
-  return {
-    replies: parseLines(result.stdout),
-    invocations: parseLines(fs.readFileSync(f.log, "utf8"))
-  };
+function expectsReply(request) {
+  if (typeof request === "string") {
+    return true;
+  }
+  if (request === null || typeof request !== "object" || Array.isArray(request)) {
+    return true;
+  }
+  if (request.jsonrpc !== "2.0" || typeof request.method !== "string") {
+    return true;
+  }
+  return request.id !== undefined;
 }
 
-function invoke(f, name, args) {
-  const { replies, invocations } = runServer(f, rpc(1, "tools/call", { name, arguments: args }));
+async function runServer(f, ...requests) {
+  const expectedReplies = requests.filter(expectsReply).length;
+  const input = requests.map((request) => typeof request === "string" ? request : JSON.stringify(request));
+  const signal = AbortSignal.timeout(10_000);
+  const server = spawn(process.execPath, [SERVER], serverOptions(f));
+  const exited = once(server, "close", { signal });
+  const replies = [];
+  let stdoutBuffer = "";
+  let stderr = "";
+  let ended = false;
+
+  const maybeEnd = () => {
+    if (!ended && replies.length >= expectedReplies) {
+      ended = true;
+      server.stdin.end();
+    }
+  };
+
+  server.stdout.setEncoding("utf8").on("data", (chunk) => {
+    stdoutBuffer += chunk;
+    const lines = stdoutBuffer.split("\n");
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (line.trim()) {
+        replies.push(JSON.parse(line));
+      }
+    }
+    maybeEnd();
+  });
+  server.stderr.setEncoding("utf8").on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  try {
+    for (const line of input) {
+      server.stdin.write(`${line}\n`);
+    }
+    maybeEnd();
+    const [status, exitSignal] = await exited;
+    assert.equal(exitSignal, null, stderr);
+    assert.equal(status, 0, stderr);
+    assert.equal(stderr, "");
+    const parseLines = (text) => text.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    return {
+      replies,
+      invocations: parseLines(fs.readFileSync(f.log, "utf8"))
+    };
+  } finally {
+    server.kill("SIGKILL");
+  }
+}
+
+async function invoke(f, name, args) {
+  const { replies, invocations } = await runServer(f, rpc(1, "tools/call", { name, arguments: args }));
   assert.equal(replies.length, 1);
   const { result, ...envelope } = replies[0];
   assert.deepEqual(envelope, { jsonrpc: "2.0", id: 1 });
@@ -135,8 +182,8 @@ function invoke(f, name, args) {
   return { text, isError: result.isError, invocations };
 }
 
-test("initializes and lists typed tools", (t) => {
-  const { replies, invocations } = runServer(
+test("initializes and lists typed tools", async (t) => {
+  const { replies, invocations } = await runServer(
     fixture(t),
     rpc("init", "initialize", { protocolVersion: "2025-06-18" }),
     rpc(undefined, "notifications/initialized"),
@@ -190,10 +237,10 @@ for (const [label, options, targetArgs, header] of [
   ["base", { target: "base", base: "main" }, ["--base", "main"], "base main"],
   ["commit", { target: "commit", commit: "abc123" }, ["--commit", "abc123"], "commit abc123"]
 ]) {
-  test(`reviews ${label} changes`, (t) => {
+  test(`reviews ${label} changes`, async (t) => {
     const f = fixture(t);
     const prompt = "Check framing.\nKeep the answer short.";
-    const { replies, invocations } = runServer(
+    const { replies, invocations } = await runServer(
       f,
       rpc(1, "tools/call", { name: "codex_review", arguments: { cwd: f.cwd, ...options } }),
       rpc(2, "tools/call", { name: "codex_review", arguments: { cwd: f.cwd, ...options, prompt } })
@@ -216,10 +263,10 @@ for (const [label, options, flags] of [
     ["-s", "workspace-write", "-m", "test-model", "--worktree"]],
   ["with ephemeral session", { worktree: false, ephemeral: true }, ["-s", "read-only", "--ephemeral"]]
 ]) {
-  test(`executes ${label}`, (t) => {
+  test(`executes ${label}`, async (t) => {
     const f = fixture(t);
     const prompt = "Describe `$(echo literal)`\nInclude both lines.";
-    const { text, isError, invocations } = invoke(f, "codex_exec", { cwd: f.cwd, prompt, ...options });
+    const { text, isError, invocations } = await invoke(f, "codex_exec", { cwd: f.cwd, prompt, ...options });
     const [sandboxFlag, sandbox, ...optionalFlags] = flags;
     assert.equal(isError, false);
     assert.deepEqual(JSON.parse(text), execResult);
@@ -233,9 +280,9 @@ for (const [label, mode, finalMessage] of [
   ["plain text", "fallback", "Plain output."],
   ["cleaned events", "events-only", '{"type":"session.started","session_id":"session-456"}\n{"type":"turn.completed"}']
 ]) {
-  test(`falls back to ${label}`, (t) => {
+  test(`falls back to ${label}`, async (t) => {
     const f = fixture(t, { mode });
-    const { text, isError } = invoke(f, "codex_exec", { cwd: f.cwd, prompt: "Report results." });
+    const { text, isError } = await invoke(f, "codex_exec", { cwd: f.cwd, prompt: "Report results." });
     assert.equal(isError, false);
     assert.deepEqual(JSON.parse(text), { sessionId: "session-456", finalMessage });
   });
@@ -246,10 +293,10 @@ for (const [label, sessionId, selection] of [
   ["the latest session", undefined, ["--last"]],
   ["a dash-prefixed name", "--last", ["--", "--last"]]
 ]) {
-  test(`resumes ${label}`, (t) => {
+  test(`resumes ${label}`, async (t) => {
     const f = fixture(t);
     const prompt = "Continue from the previous message.";
-    const { text, isError, invocations } = invoke(f, "codex_resume", { cwd: f.cwd, prompt, sessionId });
+    const { text, isError, invocations } = await invoke(f, "codex_resume", { cwd: f.cwd, prompt, sessionId });
     assert.equal(isError, false);
     assert.deepEqual(JSON.parse(text), execResult);
     assert.deepEqual(invocations, [{ argv: ["exec", "resume", "--json", ...selection, "-"], cwd: f.cwd, input: prompt }]);
@@ -260,17 +307,17 @@ for (const [label, mode, commands, report] of [
   ["with a summary", "", [["doctor", "--summary"]], "Summary checks passed."],
   ["with legacy fallback", "legacy", [["doctor", "--summary"], ["doctor"]], "Detailed checks passed."]
 ]) {
-  test(`diagnoses ${label}`, (t) => {
+  test(`diagnoses ${label}`, async (t) => {
     const f = fixture(t, { mode });
     const cwd = mode === "legacy" ? f.cwd : f.root;
-    const { text, isError, invocations } = invoke(f, "codex_doctor", mode === "legacy" ? { cwd } : undefined);
+    const { text, isError, invocations } = await invoke(f, "codex_doctor", mode === "legacy" ? { cwd } : undefined);
     assert.equal(isError, false);
     assert.equal(text, `codex-cli 0.test\n\n${report}`);
     assert.deepEqual(invocations, [["--version"], ...commands].map((argv) => ({ argv, cwd, input: "" })));
   });
 }
 
-test("rejects invalid tool arguments", (t) => {
+test("rejects invalid tool arguments", async (t) => {
   const f = fixture(t);
   const requests = [
     ["codex_review", {}, /cwd is required/],
@@ -289,7 +336,7 @@ test("rejects invalid tool arguments", (t) => {
     ["codex_resume", { cwd: f.cwd, prompt: "" }, /prompt must not be empty/],
     ["codex_doctor", null, /arguments must be an object/]
   ];
-  const { replies, invocations } = runServer(f, ...requests.map(([name, args], index) => (
+  const { replies, invocations } = await runServer(f, ...requests.map(([name, args], index) => (
     rpc(index, "tools/call", { name, arguments: args })
   )));
   assert.deepEqual(invocations, []);
@@ -300,71 +347,76 @@ test("rejects invalid tool arguments", (t) => {
   }
 });
 
-test("reports missing Codex binary", (t) => {
+test("reports missing Codex binary", async (t) => {
   const f = fixture(t, { withCodex: false });
-  const { text, isError, invocations } = invoke(f, "codex_review", { cwd: f.cwd });
+  const { text, isError, invocations } = await invoke(f, "codex_review", { cwd: f.cwd });
   assert.equal(isError, true);
   assert.match(text, /Codex.*PATH/);
   assert.deepEqual(invocations, []);
 });
 
-test("reports Codex exit details", (t) => {
+test("reports Codex exit details", async (t) => {
   const f = fixture(t, { mode: "unhealthy" });
-  const { text, isError, invocations } = invoke(f, "codex_doctor");
+  const { text, isError, invocations } = await invoke(f, "codex_doctor");
   assert.equal(isError, true);
   assert.match(text, /exited with code 3.*\nCodex startup warning\.\nDoctor login check failed/);
   assert.deepEqual(invocations.map(({ argv }) => argv), [["--version"], ["doctor", "--summary"]]);
 });
 
-test("terminates active Codex child", async (t) => {
-  const f = fixture(t, { mode: "hold" });
-  const signal = AbortSignal.timeout(5_000);
-  const updates = fs.promises.watch(f.log, { signal });
-  const server = spawn(process.execPath, [SERVER], serverOptions(f));
-  const exited = once(server, "close", { signal });
-  let codexPid;
-  let codexStopped = false;
+for (const [label, trigger, expectedStatus] of [
+  ["on SIGTERM", (server) => server.kill("SIGTERM"), 143],
+  ["when stdin closes", (server) => server.stdin.end(), 0]
+]) {
+  test(`terminates active Codex child ${label}`, async (t) => {
+    const f = fixture(t, { mode: "hold" });
+    const signal = AbortSignal.timeout(5_000);
+    const updates = fs.promises.watch(f.log, { signal });
+    const server = spawn(process.execPath, [SERVER], serverOptions(f));
+    const exited = once(server, "close", { signal });
+    let codexPid;
+    let codexStopped = false;
 
-  async function stopOnStart() {
-    for await (const update of updates) {
-      if (update.eventType !== "change") continue;
-      const [invocation, status] = fs.readFileSync(f.log, "utf8").trimEnd().split("\n");
-      if (invocation && codexPid === undefined) {
-        codexPid = JSON.parse(invocation).pid;
-        server.kill("SIGTERM");
-      }
-      if (status === '"stopped"') {
-        codexStopped = true;
-        return;
-      }
-    }
-  }
-
-  try {
-    const request = rpc(1, "tools/call", {
-      name: "codex_exec",
-      arguments: { cwd: f.cwd, prompt: "Hold.", sandbox: "workspace-write" }
-    });
-    const stopped = stopOnStart();
-    server.stdin.end(`${JSON.stringify(request)}\n`);
-    const [exitStatus] = await Promise.all([exited, stopped]);
-    assert.ok(codexStopped);
-    assert.deepEqual(exitStatus, [143, null]);
-  } finally {
-    server.kill("SIGKILL");
-    if (codexPid && !codexStopped) {
-      try {
-        process.kill(codexPid, "SIGKILL");
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
+    async function stopOnStart() {
+      for await (const update of updates) {
+        if (update.eventType !== "change") continue;
+        const [invocation, status] = fs.readFileSync(f.log, "utf8").trimEnd().split("\n");
+        if (invocation && codexPid === undefined) {
+          codexPid = JSON.parse(invocation).pid;
+          trigger(server);
+        }
+        if (status === '"stopped"') {
+          codexStopped = true;
+          return;
+        }
       }
     }
-  }
-});
 
-test("surfaces incompatible exec flags", (t) => {
+    try {
+      const request = rpc(1, "tools/call", {
+        name: "codex_exec",
+        arguments: { cwd: f.cwd, prompt: "Hold.", sandbox: "workspace-write" }
+      });
+      const stopped = stopOnStart();
+      server.stdin.write(`${JSON.stringify(request)}\n`);
+      const [exitStatus] = await Promise.all([exited, stopped]);
+      assert.ok(codexStopped);
+      assert.deepEqual(exitStatus, [expectedStatus, null]);
+    } finally {
+      server.kill("SIGKILL");
+      if (codexPid && !codexStopped) {
+        try {
+          process.kill(codexPid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+    }
+  });
+}
+
+test("surfaces incompatible exec flags", async (t) => {
   const f = fixture(t);
-  const { text, isError, invocations } = invoke(f, "codex_exec", {
+  const { text, isError, invocations } = await invoke(f, "codex_exec", {
     cwd: f.cwd, prompt: "Hello", ephemeral: true, worktree: true
   });
   assert.equal(isError, true);
@@ -431,8 +483,8 @@ test("answers ping while Codex child is running", async (t) => {
   }
 });
 
-test("recovers after protocol errors", (t) => {
-  const { replies, invocations } = runServer(
+test("recovers after protocol errors", async (t) => {
+  const { replies, invocations } = await runServer(
     fixture(t),
     "{",
     {},

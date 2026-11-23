@@ -348,7 +348,13 @@ async function handleLine(line) {
   }
 }
 
+let shuttingDown = false;
+
 function shutdown(exitCode) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
   for (const child of activeChildren) {
     child.kill();
   }
@@ -364,3 +370,4 @@ input.on("line", (line) => {
   // Keep reading requests while Codex is running so that pings can still be answered.
   handleLine(line).catch((error) => process.stderr.write(`MCP server error: ${error.message}\n`));
 });
+input.once("close", () => shutdown(0));

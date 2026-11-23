@@ -128,7 +128,7 @@ With a custom review `prompt`, the server includes the selected target in the in
 1. **Direct subprocess spawning (no shell):** Every tool call validates JSON arguments against its schema and spawns `codex` with an explicit argument array (`spawn("codex", args)`), passing prompts over `stdin` and keeping all diagnostics off `stdout`.
 2. **Automatic flag adaptation:** Because `codex review` forbids combining `--uncommitted`/`--base`/`--commit` with a custom prompt, `codex_review` switches to `codex review -` with a `Target:` header when `prompt` is provided.
 3. **Structured JSONL extraction:** `codex_exec` and `codex_resume` run `codex exec --json` and parse the event stream into `{ sessionId, finalMessage }`, discarding intermediate progress chatter.
-4. **Responsive lifecycle handling:** The server continues reading `stdin` while `codex` runs (so `ping` requests still succeed) and terminates any active `codex` child processes on `SIGINT`, `SIGTERM`, or `stdout` errors.
+4. **Responsive lifecycle handling:** The server continues reading `stdin` while `codex` runs (so `ping` requests still succeed) and terminates any active `codex` child processes when `stdin` closes or on `SIGINT`, `SIGTERM`, or `stdout` errors.
 
 ### Why MCP Over v0.1 CLI Skills (and When to Use Each)
 
