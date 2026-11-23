@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 import { promises as fs } from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import { createInterface } from "node:readline";
 import {
-  boundedOutput, cleanOutput, runCodex, runCommand, terminateActiveCommands, truncationMarker, withAbort
+  cleanOutput, collectExecEvents, runCodex, runGit, terminateActiveCommands, withAbort
 } from "./codex-command.mjs";
 
 const cwdProperty = { type: "string", minLength: 1, description: "Working directory for Codex." };
@@ -149,68 +150,6 @@ async function validateCwd(cwd, signal) {
   }
 }
 
-function collectExecEvents() {
-  let line = boundedOutput();
-  let sawEvents = false;
-  let sessionId = null;
-  let finalMessage = null;
-
-  function parseLine() {
-    const text = cleanOutput(line.text());
-    if (line.truncated) {
-      // Codex writes the event type before the payload, including oversized items.
-      const event = /^\{\s*"type"\s*:\s*"([^"]+)"/.exec(text);
-      if (!event) {
-        return;
-      }
-      sawEvents = true;
-      const [prefix, type] = event;
-      const completedAgentMessage = /^\s*,\s*"item"\s*:\s*\{(?:\s*"id"\s*:\s*"[^"]*"\s*,)?\s*"type"\s*:\s*"agent_message"/;
-      if (type === "agent_message" || (type === "item.completed" && completedAgentMessage.test(text.slice(prefix.length)))) {
-        finalMessage = truncationMarker;
-      }
-      return;
-    }
-    let event;
-    try {
-      event = JSON.parse(text);
-    } catch {
-      return;
-    }
-    if (typeof event?.type !== "string") {
-      return;
-    }
-    sawEvents = true;
-    if (event.type === "thread.started" || event.type === "session.started") {
-      const id = event.thread_id ?? event.session_id;
-      if (typeof id === "string") {
-        sessionId = id;
-      }
-    }
-    const item = event.type === "item.completed" ? event.item : event;
-    if (item?.type === "agent_message" && typeof item.text === "string") {
-      finalMessage = item.text;
-    }
-  }
-
-  return {
-    append(chunk) {
-      let start = 0;
-      for (let end = chunk.indexOf(10); end !== -1; end = chunk.indexOf(10, start)) {
-        line.append(chunk.subarray(start, end));
-        parseLine();
-        line = boundedOutput();
-        start = end + 1;
-      }
-      line.append(chunk.subarray(start));
-    },
-    finish(stdout) {
-      parseLine();
-      return { sessionId, finalMessage: sawEvents ? finalMessage : cleanOutput(stdout) };
-    }
-  };
-}
-
 function effortArgs(effort) {
   return effort === undefined ? [] : ["-c", `model_reasoning_effort=${effort}`];
 }
@@ -230,31 +169,39 @@ async function review({ cwd, target = "uncommitted", base, commit, prompt, effor
   if (target !== "uncommitted" && ref === undefined) {
     throw new Error(`${target} is required when target is ${target}.`);
   }
+  let sha;
+  if (ref !== undefined) {
+    try {
+      const { stdout } = await runGit(["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], { cwd, signal });
+      sha = stdout.trim();
+    } catch (error) {
+      signal.throwIfAborted();
+      throw new Error(`Cannot resolve Git ref ${JSON.stringify(ref)} to a commit. ${error.message}`, { cause: error });
+    }
+  }
   const args = ["exec", "-s", "read-only", ...effortArgs(effort), "review"];
   if (prompt !== undefined) {
-    let header = target;
-    if (ref !== undefined) {
-      try {
-        const { stdout } = await runCommand("git", ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], {
-          cwd, signal, label: "Git"
-        });
-        header += ` ${stdout.trim()}`;
-      } catch (error) {
-        signal.throwIfAborted();
-        throw new Error(`Cannot resolve Git ref ${JSON.stringify(ref)} to a commit. ${error.message}`, { cause: error });
-      }
-    }
+    const header = sha === undefined ? target : `${target} ${sha}`;
     return commandOutput(await runCodex([...args, "-"], { cwd, input: `Target: ${header}\n\n${prompt}`, signal }));
   }
   args.push(`--${target}`);
   if (ref !== undefined) {
-    args.push(ref);
+    args.push(target === "commit" || ref.startsWith("-") ? sha : ref);
   }
   return commandOutput(await runCodex(args, { cwd, signal }));
 }
 
 async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephemeral, effort }, signal) {
-  const args = ["exec", "--json", "-s", sandbox, "-C", cwd, ...effortArgs(effort)];
+  if (worktree && ephemeral) {
+    throw new Error("worktree and ephemeral cannot be combined.");
+  }
+  if (worktree && sandbox !== "workspace-write") {
+    throw new Error('worktree requires sandbox "workspace-write".');
+  }
+  if (model !== undefined && model.startsWith("-")) {
+    throw new Error("model must not start with '-'.");
+  }
+  const args = ["exec", "--json", "-s", sandbox, "-C", path.resolve(cwd), ...effortArgs(effort)];
   if (model !== undefined) {
     args.push("-m", model);
   }
@@ -264,7 +211,9 @@ async function exec({ cwd, prompt, sandbox = "read-only", model, worktree, ephem
   if (ephemeral) {
     args.push("--ephemeral");
   }
-  const { result } = await runCodex([...args, "-"], { input: prompt, signal, events: collectExecEvents() });
+  const { result } = await runCodex([...args, "-"], {
+    input: prompt, signal, events: collectExecEvents({ fallbackToStdout: true })
+  });
   return JSON.stringify(result);
 }
 
@@ -279,7 +228,9 @@ async function resume({ cwd, prompt, sessionId, sandbox = "read-only", effort },
     }
     args.push(sessionId);
   }
-  const { result } = await runCodex([...args, "-"], { cwd, input: prompt, signal, events: collectExecEvents() });
+  const { result } = await runCodex([...args, "-"], {
+    cwd, input: prompt, signal, events: collectExecEvents({ fallbackToStdout: true })
+  });
   return JSON.stringify(result);
 }
 

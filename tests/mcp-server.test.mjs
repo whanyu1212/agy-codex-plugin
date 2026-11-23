@@ -171,20 +171,24 @@ function rpc(id, method, params) {
   return { jsonrpc: "2.0", id, method, params };
 }
 
-function serverOptions({ root, bin, log, mode, withGit }) {
+function serverOptions({ root, bin, log, mode, withGit, pathPrefix = [] }) {
+  const searchPath = [...pathPrefix, fakeCodexPath(bin, withGit)].join(path.delimiter);
   return {
     cwd: root,
-    env: envWithPath(fakeCodexPath(bin, withGit), { FAKE_CODEX_LOG: log, FAKE_CODEX_MODE: mode })
+    env: envWithPath(searchPath, { FAKE_CODEX_LOG: log, FAKE_CODEX_MODE: mode })
   };
+}
+
+function git(f, ...args) {
+  return execFileSync("git", args, { cwd: f.cwd, encoding: "utf8", timeout: 3_000 }).trim();
 }
 
 function initGit(f) {
   f.withGit = true;
-  const git = (...args) => execFileSync("git", args, { cwd: f.cwd, encoding: "utf8", timeout: 3_000 }).trim();
-  git("init", "-q", "-b", "main");
-  git("-c", "user.name=MCP test", "-c", "user.email=mcp@example.invalid", "-c", "commit.gpgsign=false",
+  git(f, "init", "-q", "-b", "main");
+  git(f, "-c", "user.name=MCP test", "-c", "user.email=mcp@example.invalid", "-c", "commit.gpgsign=false",
     "commit", "-qm", "Initial commit", "--allow-empty");
-  return git("rev-parse", "HEAD");
+  return git(f, "rev-parse", "HEAD");
 }
 
 function expectsReply(request) {
@@ -336,14 +340,19 @@ test("initializes and lists typed tools", async (t) => {
   }
 });
 
-for (const [label, options, targetArgs] of [
-  ["uncommitted", {}, ["--uncommitted"]],
-  ["base", { target: "base", base: "main" }, ["--base", "main"]],
-  ["commit", { target: "commit", commit: "HEAD" }, ["--commit", "HEAD"]]
+for (const [label, options] of [
+  ["uncommitted", {}],
+  ["base", { target: "base", base: "main" }],
+  ["commit", { target: "commit", commit: "HEAD" }]
 ]) {
   test(`reviews ${label} changes`, async (t) => {
     const f = fixture(t);
-    const header = options.target ? `${label} ${initGit(f)}` : label;
+    const sha = options.target ? initGit(f) : null;
+    const header = sha ? `${label} ${sha}` : label;
+    const targetArgs = [`--${label}`];
+    if (sha) {
+      targetArgs.push(label === "commit" ? sha : options.base);
+    }
     const prompt = "Check framing.\nKeep the answer short.";
     const { replies, invocations } = await runServer(
       f,
@@ -365,14 +374,55 @@ for (const [target, ref] of [["base", "missing-branch"], ["commit", "--help"], [
   test(`rejects invalid ${target} ref ${ref}`, async (t) => {
     const f = fixture(t);
     initGit(f);
-    const { text, isError, invocations } = await invoke(f, "codex_review", {
-      cwd: f.cwd, target, [target]: ref, prompt: "Check framing."
-    });
-    assert.equal(isError, true);
-    assert.match(text, /Cannot resolve Git ref/);
+    const args = { cwd: f.cwd, target, [target]: ref };
+    const { replies, invocations } = await runServer(
+      f,
+      rpc(1, "tools/call", { name: "codex_review", arguments: args }),
+      rpc(2, "tools/call", { name: "codex_review", arguments: { ...args, prompt: "Check framing." } })
+    );
+    for (const { result } of replies) {
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /Cannot resolve Git ref/);
+    }
     assert.deepEqual(invocations, []);
   });
 }
+
+test("pins dash-prefixed base refs", async (t) => {
+  const f = fixture(t);
+  const sha = initGit(f);
+  git(f, "update-ref", "refs/tags/-review", sha);
+
+  const { isError, invocations } = await invoke(f, "codex_review", { cwd: f.cwd, target: "base", base: "-review" });
+  assert.equal(isError, false);
+  assert.deepEqual(invocations.map(({ argv }) => argv), [["exec", "-s", "read-only", "review", "--base", sha]]);
+});
+
+test("ignores relative PATH entries", async (t) => {
+  const f = fixture(t);
+  const sha = initGit(f);
+  const relativeBin = "relative-bin";
+  f.pathPrefix = [relativeBin];
+  if (isWindows) {
+    const currentDriveBin = path.relative(path.parse(f.root).root, path.join(f.root, relativeBin));
+    f.pathPrefix.push(path.join(path.sep, currentDriveBin));
+  }
+  for (const parent of [f.root, f.cwd]) {
+    const bin = path.join(parent, relativeBin);
+    fs.mkdirSync(bin);
+    if (isWindows) {
+      fs.writeFileSync(path.join(bin, "git.exe"), "not an executable");
+      fs.writeFileSync(path.join(bin, "codex.exe"), "not an executable");
+    } else {
+      fs.writeFileSync(path.join(bin, "git"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, "codex"), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+    }
+  }
+
+  const { isError, invocations } = await invoke(f, "codex_review", { cwd: f.cwd, target: "commit", commit: "HEAD" });
+  assert.equal(isError, false);
+  assert.deepEqual(invocations.map(({ argv }) => argv), [["exec", "-s", "read-only", "review", "--commit", sha]]);
+});
 
 const execResult = { sessionId: "thread-123", finalMessage: "Done.\nAll set." };
 for (const [name, effort, subcommand, timeoutMs] of [
@@ -401,7 +451,9 @@ for (const [label, options, flags] of [
   test(`executes ${label}`, async (t) => {
     const f = fixture(t);
     const prompt = "Describe `$(echo literal)`\nInclude both lines.";
-    const { text, isError, invocations } = await invoke(f, "codex_exec", { cwd: f.cwd, prompt, ...options });
+    const { text, isError, invocations } = await invoke(f, "codex_exec", {
+      cwd: path.basename(f.cwd), prompt, ...options
+    });
     const [sandboxFlag, sandbox, ...optionalFlags] = flags;
     assert.equal(isError, false);
     assert.deepEqual(JSON.parse(text), execResult);
@@ -699,15 +751,20 @@ for (const [label, trigger, expectedStatus, skipReason] of [
   });
 }
 
-test("surfaces incompatible exec flags", async (t) => {
-  const f = fixture(t);
-  const { text, isError, invocations } = await invoke(f, "codex_exec", {
-    cwd: f.cwd, prompt: "Hello", ephemeral: true, worktree: true
+for (const [label, options, message] of [
+  ["worktree with ephemeral", { worktree: true, ephemeral: true, sandbox: "workspace-write" },
+    "worktree and ephemeral cannot be combined."],
+  ["read-only worktree", { worktree: true, sandbox: "read-only" }, 'worktree requires sandbox "workspace-write".'],
+  ["dash-prefixed model", { model: "--help" }, "model must not start with '-'."]
+]) {
+  test(`rejects ${label}`, async (t) => {
+    const f = fixture(t);
+    const { text, isError, invocations } = await invoke(f, "codex_exec", { cwd: f.cwd, prompt: "Hello", ...options });
+    assert.equal(isError, true);
+    assert.equal(text, message);
+    assert.deepEqual(invocations, []);
   });
-  assert.equal(isError, true);
-  assert.match(text, /--worktree cannot be combined with --ephemeral/);
-  assert.deepEqual(invocations[0].argv.slice(-3), ["--worktree", "--ephemeral", "-"]);
-});
+}
 
 test("times out and terminates Codex", async (t) => {
   const f = fixture(t, { mode: "hold" });
