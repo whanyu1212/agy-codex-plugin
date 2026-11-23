@@ -32,15 +32,105 @@ if (holding) {
   });
   invocation.pid = process.pid;
 }
-if (mode === "lingering-pipe") {
-  const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20_000)"], {
-    stdio: ["ignore", 1, 2]
-  });
-  descendant.unref();
-  invocation.descendantPid = descendant.pid;
-}
 const recordInvocation = () => fs.appendFileSync(log, JSON.stringify(invocation) + "\n");
-if (mode === "group-hold" && holding) {
+const emit = (event) => console.log(JSON.stringify(event));
+
+function start() {
+  recordInvocation();
+  switch (argv.includes("review") ? "review" : argv[0]) {
+    case "review":
+      console.log("Review complete.");
+      break;
+    case "exec":
+      if (holding) {
+        setInterval(() => {}, 60_000);
+        break;
+      }
+      if (argv.includes("--worktree") && argv.includes("--ephemeral")) {
+        console.error("--worktree cannot be combined with --ephemeral");
+        process.exit(1);
+      }
+      if (mode === "fallback" || mode === "events-and-text") {
+        console.log("\x1b[32mPlain output.\x1b[0m");
+        if (mode === "fallback") break;
+      }
+      if (mode === "events-only" || mode === "events-and-text") {
+        emit({ type: "session.started", session_id: "session-456" });
+        emit({ type: "turn.completed" });
+        break;
+      }
+      if (mode === "large-output") {
+        process.stderr.write("stderr: " + "e".repeat(2 ** 21) + "\nstderr tail");
+        process.stdout.write("stdout: " + "o".repeat(2 ** 21) + "\nstdout tail");
+        process.exitCode = 3;
+        break;
+      }
+      if (mode === "large-plain") {
+        console.log('{ "notice": "' + "x".repeat(2 ** 21) + '" }');
+        break;
+      }
+      if (mode === "large-event") {
+        emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "x".repeat(2 ** 21) } });
+      }
+      emit({ type: "thread.started", thread_id: "thread-123" });
+      emit({ type: "item.completed", item: { type: "agent_message", text: "Working on it." } });
+      console.log("CLI notice.");
+      emit({ type: "item.completed", item: { type: "agent_message", text: "Done.\nAll set." } });
+      if (mode === "large-final") {
+        emit({ type: "item.completed", item: { id: "item_3", type: "agent_message", text: "x".repeat(2 ** 21) } });
+      }
+      if (mode === "large-mcp-call") {
+        emit({ type: "item.completed", item: {
+          id: "item_3", type: "mcp_tool_call", arguments: { type: "agent_message", text: "x".repeat(2 ** 21) }
+        } });
+      }
+      emit({ type: "item.completed", item: { type: "reasoning", text: "Private reasoning." } });
+      emit({ type: "turn.completed" });
+      break;
+    case "--version":
+      console.log("codex-cli 0.test");
+      break;
+    case "doctor":
+      if (argv[1] === "--summary") {
+        if (mode === "legacy") {
+          console.error("error: unexpected argument '--summary' found");
+          process.exit(2);
+        }
+        if (mode === "unhealthy") {
+          console.error("Codex startup warning.");
+          console.log("Doctor login check failed.");
+          process.exit(3);
+        }
+        console.log("Summary checks passed.");
+      } else {
+        console.log("Detailed checks passed.");
+      }
+      break;
+    default:
+      console.error("Unexpected Codex arguments.");
+      process.exit(4);
+  }
+}
+
+if (mode === "lingering-pipe") {
+  const descendant = spawn(
+    process.execPath,
+    ["-e", 'setInterval(() => {}, 60_000); process.send("ready");'],
+    { stdio: ["ignore", "inherit", "inherit", "ipc"], detached: true, windowsHide: true }
+  );
+  invocation.descendantPid = descendant.pid;
+  const onEarlyExit = (code, signal) => {
+    console.error("lingering-pipe descendant exited before ready:", { code, signal });
+    process.exit(1);
+  };
+  descendant.once("exit", onEarlyExit);
+  descendant.once("message", () => {
+    descendant.removeListener("exit", onEarlyExit);
+    descendant.disconnect();
+    descendant.unref();
+    start();
+  });
+} else if (mode === "group-hold" && holding) {
   const code = [
     'const fs = require("node:fs");',
     'process.on("SIGTERM", () => fs.appendFileSync(process.argv[1], JSON.stringify("descendant trapped") + "\\n"));',
@@ -51,85 +141,10 @@ if (mode === "group-hold" && holding) {
   invocation.descendantPid = descendant.pid;
   descendant.once("message", () => {
     descendant.disconnect();
-    recordInvocation();
+    start();
   });
 } else {
-  recordInvocation();
-}
-const emit = (event) => console.log(JSON.stringify(event));
-
-switch (argv.includes("review") ? "review" : argv[0]) {
-  case "review":
-    console.log("Review complete.");
-    break;
-  case "exec":
-    if (holding) {
-      setInterval(() => {}, 60_000);
-      break;
-    }
-    if (argv.includes("--worktree") && argv.includes("--ephemeral")) {
-      console.error("--worktree cannot be combined with --ephemeral");
-      process.exit(1);
-    }
-    if (mode === "fallback" || mode === "events-and-text") {
-      console.log("\x1b[32mPlain output.\x1b[0m");
-      if (mode === "fallback") break;
-    }
-    if (mode === "events-only" || mode === "events-and-text") {
-      emit({ type: "session.started", session_id: "session-456" });
-      emit({ type: "turn.completed" });
-      break;
-    }
-    if (mode === "large-output") {
-      process.stderr.write("stderr: " + "e".repeat(2 ** 21) + "\nstderr tail");
-      process.stdout.write("stdout: " + "o".repeat(2 ** 21) + "\nstdout tail");
-      process.exitCode = 3;
-      break;
-    }
-    if (mode === "large-plain") {
-      console.log('{ "notice": "' + "x".repeat(2 ** 21) + '" }');
-      break;
-    }
-    if (mode === "large-event") {
-      emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "x".repeat(2 ** 21) } });
-    }
-    emit({ type: "thread.started", thread_id: "thread-123" });
-    emit({ type: "item.completed", item: { type: "agent_message", text: "Working on it." } });
-    console.log("CLI notice.");
-    emit({ type: "item.completed", item: { type: "agent_message", text: "Done.\nAll set." } });
-    if (mode === "large-final") {
-      emit({ type: "item.completed", item: { id: "item_3", type: "agent_message", text: "x".repeat(2 ** 21) } });
-    }
-    if (mode === "large-mcp-call") {
-      emit({ type: "item.completed", item: {
-        id: "item_3", type: "mcp_tool_call", arguments: { type: "agent_message", text: "x".repeat(2 ** 21) }
-      } });
-    }
-    emit({ type: "item.completed", item: { type: "reasoning", text: "Private reasoning." } });
-    emit({ type: "turn.completed" });
-    break;
-  case "--version":
-    console.log("codex-cli 0.test");
-    break;
-  case "doctor":
-    if (argv[1] === "--summary") {
-      if (mode === "legacy") {
-        console.error("error: unexpected argument '--summary' found");
-        process.exit(2);
-      }
-      if (mode === "unhealthy") {
-        console.error("Codex startup warning.");
-        console.log("Doctor login check failed.");
-        process.exit(3);
-      }
-      console.log("Summary checks passed.");
-    } else {
-      console.log("Detailed checks passed.");
-    }
-    break;
-  default:
-    console.error("Unexpected Codex arguments.");
-    process.exit(4);
+  start();
 }
 `;
 
